@@ -1,5 +1,5 @@
 // ===============================================================
-//  BACKEND FINAL SAAS — Billing + Stripe Connect + Firestore + IA
+//  BACKEND FINAL SAAS — Stripe + Connect + Firestore (CORRIGÉ)
 // ===============================================================
 
 import express    from "express"
@@ -51,7 +51,7 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
   }
 
   // ===========================================================
-  // 💰 BILLING (TON ARGENT)
+  // 💰 CHECKOUT SUCCESS
   // ===========================================================
   if (event.type === "checkout.session.completed") {
     const session = event.data.object
@@ -61,7 +61,7 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
         ? JSON.parse(session.metadata.data)
         : {}
 
-      // 🔹 CAS 1 : ABONNEMENT SAAS
+      // 🔹 SAAS BILLING
       if (metadata.type === "billing") {
         await db.collection("subscriptions").doc(session.id).set({
           email: session.customer_email,
@@ -74,7 +74,7 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
         console.log("💰 Abonnement SaaS activé")
       }
 
-      // 🔹 CAS 2 : COMMANDE STORE (Stripe Connect)
+      // 🔹 STORE PAYMENT
       if (metadata.type === "store_payment") {
         await db.collection("orders").doc(session.id).set({
           email: session.customer_email,
@@ -97,15 +97,15 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
 app.use(express.json())
 
 // ===============================================================
-// 💰 BILLING (OWNER → TOI)
+// 💰 BILLING (USER → TOI)
 // ===============================================================
 app.post("/create-billing-session", async (req, res) => {
   try {
     const { email, plan, ownerUid } = req.body
 
     const prices = {
-      basic: 500,   // 5€
-      pro:   1500,  // 15€
+      basic: 500,
+      pro:   1500,
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -125,8 +125,8 @@ app.post("/create-billing-session", async (req, res) => {
 
       mode: "payment",
 
-      success_url: "https://tonsite.com/success",
-      cancel_url:  "https://tonsite.com/cancel",
+      success_url: "https://musrh.github.io/SaasBuilder/#/success",
+      cancel_url:  "https://musrh.github.io/SaasBuilder/#/cancel",
 
       metadata: {
         data: JSON.stringify({
@@ -151,13 +151,16 @@ app.post("/create-store-session", async (req, res) => {
   try {
     const { items, email, ownerUid } = req.body
 
-    // 🔥 récupérer le compte Stripe du owner
+    console.log("🛒 Création paiement store pour:", ownerUid)
+
     const userDoc = await db.collection("users").doc(ownerUid).get()
     const ownerStripeAccount = userDoc.data()?.stripeAccountId
 
     if (!ownerStripeAccount) {
       return res.status(400).json({ error: "Owner non connecté à Stripe" })
     }
+
+    console.log("💳 Paiement vers:", ownerStripeAccount)
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -174,15 +177,15 @@ app.post("/create-store-session", async (req, res) => {
 
       mode: "payment",
 
-      // 🔥 STRIPE CONNECT (argent → owner)
+      // 🔥 TRANSFERT VERS OWNER
       payment_intent_data: {
         transfer_data: {
           destination: ownerStripeAccount,
         },
       },
 
-      success_url: "https://tonsite.com/success",
-      cancel_url:  "https://tonsite.com/cancel",
+      success_url: "https://musrh.github.io/SaasBuilder/#/success",
+      cancel_url:  "https://musrh.github.io/SaasBuilder/#/cancel",
 
       metadata: {
         data: JSON.stringify({
@@ -196,50 +199,73 @@ app.post("/create-store-session", async (req, res) => {
     res.json({ url: session.url })
 
   } catch (err) {
-    console.error(err)
+    console.error("❌ Erreur store:", err)
     res.status(500).json({ error: err.message })
   }
 })
 
 // ===============================================================
-// 🔗 CONNECT STRIPE (ONBOARDING OWNER)
+// 🔗 STRIPE CONNECT (CORRIGÉ)
 // ===============================================================
 app.post("/create-connect-account", async (req, res) => {
   try {
     const { ownerUid, email } = req.body
 
-    const account = await stripe.accounts.create({
-      type: "express",
-      email,
-    })
+    console.log("📩 Connect request:", ownerUid, email)
 
-    await db.collection("users").doc(ownerUid).set({
-      stripeAccountId: account.id,
-    }, { merge: true })
+    const userRef = db.collection("users").doc(ownerUid)
+    const userDoc = await userRef.get()
 
+    let accountId
+
+    // ✅ EXISTANT
+    if (userDoc.exists && userDoc.data().stripeAccountId) {
+      accountId = userDoc.data().stripeAccountId
+      console.log("♻️ Compte existant:", accountId)
+    } 
+    // 🆕 NOUVEAU
+    else {
+      const account = await stripe.accounts.create({
+        type: "express",
+        email,
+      })
+
+      accountId = account.id
+      console.log("✅ Nouveau compte Stripe:", accountId)
+
+      await userRef.set({
+        stripeAccountId: accountId,
+      }, { merge: true })
+
+      console.log("💾 Sauvegardé dans Firestore")
+    }
+
+    // 🔗 LIEN ONBOARDING
     const link = await stripe.accountLinks.create({
-      account: account.id,
-      refresh_url: "https://tonsite.com/reauth",
-      return_url: "https://tonsite.com/dashboard",
+      account: accountId,
+      refresh_url: "https://musrh.github.io/SaasBuilder/#/reauth",
+      return_url: "https://musrh.github.io/SaasBuilder/#/dashboard?stripe=success",
       type: "account_onboarding",
     })
 
     res.json({ url: link.url })
 
   } catch (err) {
+    console.error("❌ Connect error:", err)
     res.status(500).json({ error: err.message })
   }
 })
 
 // ===============================================================
-// 🧪 DEBUG
+// 🧪 HEALTH CHECK
 // ===============================================================
 app.get("/", (req, res) => {
   res.json({
     status: "OK",
     features: [
-      "Stripe Billing (SaaS)",
-      "Stripe Connect (Stores)",
+      "Stripe Billing",
+      "Stripe Connect",
+      "Store Payments",
       "Firestore",
     ]
   })
@@ -247,5 +273,5 @@ app.get("/", (req, res) => {
 
 // ===============================================================
 app.listen(PORT, () => {
-  console.log(`🚀 Backend SaaS prêt sur port ${PORT}`)
+  console.log(`🚀 Backend prêt sur port ${PORT}`)
 })
