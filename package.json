@@ -1,7 +1,5 @@
-
-
 {
-  "name": "stripe-paypal-backend",
+  "name": "stripe-saas-backend",
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
@@ -9,13 +7,12 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^5.2.1",
+    "express": "^4.18.2",
     "firebase-admin": "^12.0.0",
-    "stripe": "^12.0.0",
-    "@paypal/checkout-server-sdk": "^1.0.3",
+    "stripe": "^14.0.0",
     "cors": "^2.8.5",
-    "axios": "^1.5.1",
     "dotenv": "^16.3.1",
+    "body-parser": "^1.20.2",
     "helmet": "^7.0.0",
     "groq-sdk": "^0.7.0"
   }
