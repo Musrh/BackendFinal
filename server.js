@@ -78,7 +78,7 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
         const userRef = db.collection("users").doc(metadata.ownerUid)
         const userSnap = await userRef.get()
 
-        if (userSnap.exists) {
+        if (userSnap.exists()) {
           await userRef.update({
             plan: metadata.plan || "pro",
             paye: true,
@@ -146,7 +146,7 @@ app.post("/create-billing-session", async (req, res) => {
 
       mode: "payment",
 
-      // ✅ SaasBuilder (ton dashboard)
+      // ✅ SaasBuilder (ton dashboard) — ?success=true déclenche le polling
       success_url: "https://musrh.github.io/SaasBuilder/#/dashboard?success=true",
       cancel_url: "https://musrh.github.io/SaasBuilder/#/dashboard",
 
