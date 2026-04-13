@@ -147,7 +147,7 @@ app.post("/create-billing-session", async (req, res) => {
       mode: "payment",
 
       // ✅ SaasBuilder (ton dashboard)
-      success_url: "https://musrh.github.io/SaasBuilder/#/success",
+      success_url: "https://musrh.github.io/SaasBuilder/#/dashboard?success=true",
       cancel_url: "https://musrh.github.io/SaasBuilder/#/dashboard",
 
       metadata: {
