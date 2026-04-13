@@ -1,5 +1,5 @@
 // ===============================================================
-// BACKEND FINAL SAAS — VERSION ARCHI PROPRE
+// BACKEND FINAL SAAS — VERSION DEBUG COMPLÈTE
 // ===============================================================
 
 import express from "express"
@@ -46,49 +46,89 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
       process.env.STRIPE_WEBHOOK_SECRET
     )
   } catch (err) {
-    console.error("❌ Webhook error:", err.message)
+    console.error("❌ Webhook signature error:", err.message)
     return res.status(400).send(`Webhook Error: ${err.message}`)
   }
+
+  console.log("📨 EVENT TYPE:", event.type)
 
   if (event.type === "checkout.session.completed") {
     const session = event.data.object
 
+    console.log("🎯 SESSION ID:", session.id)
+    console.log("💳 payment_status:", session.payment_status)
+    console.log("📧 customer_email:", session.customer_email)
+    console.log("🗂 metadata RAW:", JSON.stringify(session.metadata))
+
     if (session.payment_status === "paid") {
 
-      const metadata = session.metadata?.data
-        ? JSON.parse(session.metadata.data)
-        : {}
+      let metadata = {}
+      try {
+        metadata = session.metadata?.data
+          ? JSON.parse(session.metadata.data)
+          : {}
+        console.log("📦 METADATA PARSÉ:", JSON.stringify(metadata))
+      } catch (parseErr) {
+        console.error("❌ ERREUR PARSE METADATA:", parseErr.message)
+      }
 
-      console.log("📦 METADATA:", metadata)
+      console.log("🔑 ownerUid:", metadata.ownerUid || "VIDE/UNDEFINED")
+      console.log("📋 type:", metadata.type || "VIDE/UNDEFINED")
+      console.log("🎫 plan:", metadata.plan || "VIDE/UNDEFINED")
 
       // =======================================================
-      // 💰 SAAS BUILDER (OWNER → TOI)
+      // 💰 SAAS BUILDER
       // =======================================================
       if (metadata.type === "billing") {
+        console.log("✅ Type billing détecté")
 
-        await db.collection("subscriptions").doc(session.id).set({
-          email: session.customer_email,
-          plan: metadata.plan,
-          ownerUid: metadata.ownerUid,
-          status: "active",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        })
-
-        // 🔥 UPDATE USER (LE FIX IMPORTANT)
-        const userRef = db.collection("users").doc(metadata.ownerUid)
-        const userSnap = await userRef.get()
-
-        if (userSnap.exists()) {
-          await userRef.update({
-            plan: metadata.plan || "pro",
-            paye: true,
-            subscriptionActive: true,
-            updatedAt: Date.now()
+        // Écriture subscription
+        try {
+          await db.collection("subscriptions").doc(session.id).set({
+            email: session.customer_email,
+            plan: metadata.plan,
+            ownerUid: metadata.ownerUid,
+            status: "active",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
           })
+          console.log("✅ Subscription écrite dans Firestore")
+        } catch (e) {
+          console.error("❌ Erreur écriture subscription:", e.message)
+        }
 
-          console.log("🔥 USER PASSÉ EN PRO")
+        // Mise à jour user
+        if (!metadata.ownerUid) {
+          console.error("❌ FATAL: ownerUid vide — impossible de mettre à jour l'utilisateur")
         } else {
-          console.error("❌ USER INTROUVABLE")
+          try {
+            const userRef = db.collection("users").doc(metadata.ownerUid)
+            const userSnap = await userRef.get()
+            console.log("👤 User trouvé?", userSnap.exists, "| uid:", metadata.ownerUid)
+
+            if (userSnap.exists) {
+              console.log("📄 Données actuelles:", JSON.stringify(userSnap.data()))
+              await userRef.update({
+                plan: metadata.plan || "pro",
+                paye: true,
+                subscriptionActive: true,
+                updatedAt: Date.now()
+              })
+              console.log("🔥 USER PASSÉ EN PRO — plan:", metadata.plan || "pro")
+            } else {
+              console.error("❌ USER INTROUVABLE pour uid:", metadata.ownerUid)
+              // Tentative de création si inexistant
+              await userRef.set({
+                plan: metadata.plan || "pro",
+                paye: true,
+                subscriptionActive: true,
+                email: session.customer_email,
+                updatedAt: Date.now()
+              }, { merge: true })
+              console.log("🆕 USER CRÉÉ/MERGÉ avec plan pro")
+            }
+          } catch (e) {
+            console.error("❌ Erreur update user:", e.message)
+          }
         }
       }
 
@@ -96,18 +136,23 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
       // 🛒 SAAS GENERATOR (CLIENT → OWNER)
       // =======================================================
       if (metadata.type === "store_payment") {
-
-        await db.collection("orders").doc(session.id).set({
-          email: session.customer_email,
-          items: metadata.items || [],
-          montant: session.amount_total / 100,
-          ownerUid: metadata.ownerUid,
-          status: "paid",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        })
-
-        console.log("🛒 COMMANDE STORE OK")
+        try {
+          await db.collection("orders").doc(session.id).set({
+            email: session.customer_email,
+            items: metadata.items || [],
+            montant: session.amount_total / 100,
+            ownerUid: metadata.ownerUid,
+            status: "paid",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          })
+          console.log("🛒 COMMANDE STORE OK")
+        } catch (e) {
+          console.error("❌ Erreur commande store:", e.message)
+        }
       }
+
+    } else {
+      console.log("⏳ payment_status pas encore 'paid':", session.payment_status)
     }
   }
 
@@ -124,10 +169,24 @@ app.post("/create-billing-session", async (req, res) => {
   try {
     const { email, plan, ownerUid } = req.body
 
+    console.log("💳 create-billing-session — email:", email, "| plan:", plan, "| ownerUid:", ownerUid)
+
+    if (!ownerUid) {
+      console.error("❌ ownerUid manquant dans la requête!")
+      return res.status(400).json({ error: "ownerUid requis" })
+    }
+
     const prices = {
       basic: 500,
       pro: 1500,
     }
+
+    const metadataPayload = {
+      type: "billing",
+      plan,
+      ownerUid,
+    }
+    console.log("📦 Metadata envoyée à Stripe:", JSON.stringify(metadataPayload))
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -139,30 +198,27 @@ app.post("/create-billing-session", async (req, res) => {
           product_data: {
             name: `Abonnement ${plan}`,
           },
-          unit_amount: prices[plan],
+          unit_amount: prices[plan] || 1500,
         },
         quantity: 1,
       }],
 
       mode: "payment",
 
-      // ✅ SaasBuilder (ton dashboard) — ?success=true déclenche le polling
+      // ✅ Redirige vers /dashboard?success=true pour déclencher le polling
       success_url: "https://musrh.github.io/SaasBuilder/#/dashboard?success=true",
       cancel_url: "https://musrh.github.io/SaasBuilder/#/dashboard",
 
       metadata: {
-        data: JSON.stringify({
-          type: "billing",
-          plan,
-          ownerUid,
-        }),
+        data: JSON.stringify(metadataPayload),
       },
     })
 
+    console.log("✅ Session Stripe créée:", session.id)
     res.json({ url: session.url })
 
   } catch (err) {
-    console.error(err)
+    console.error("❌ create-billing-session error:", err.message)
     res.status(500).json({ error: err.message })
   }
 })
@@ -202,7 +258,6 @@ app.post("/create-store-session", async (req, res) => {
         },
       },
 
-      // ✅ SaaasGenerator (store client)
       success_url: "https://musrh.github.io/SaaasGenerator/#/success",
       cancel_url: "https://musrh.github.io/SaaasGenerator/#/cancel",
 
@@ -265,5 +320,5 @@ app.post("/create-connect-account", async (req, res) => {
 
 // ===============================================================
 app.listen(PORT, () => {
-  console.log(`🚀 Backend prêt`)
+  console.log(`🚀 Backend prêt sur port ${PORT}`)
 })
