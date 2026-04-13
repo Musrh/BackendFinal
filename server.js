@@ -99,7 +99,7 @@ app.use(express.json())
 // ===============================================================
 // 💰 BILLING (USER → TOI)
 // ===============================================================
-app.post("/create-billing-session", async (req, res) => {
+app.post("/create-checkout-session", async (req, res) => {
   try {
     const { email, plan, ownerUid } = req.body
 
