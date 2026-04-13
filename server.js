@@ -163,6 +163,40 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
 app.use(express.json())
 
 // ===============================================================
+// 🧪 ROUTE TEST
+// ===============================================================
+app.get("/test", (req, res) => {
+  res.json({ ok: true, message: "Backend Railway opérationnel" })
+})
+
+// ===============================================================
+// 🧪 FORCER MISE À JOUR USER — TEST UNIQUEMENT
+// POST /force-upgrade { "ownerUid": "xxx" }
+// ===============================================================
+app.post("/force-upgrade", async (req, res) => {
+  const { ownerUid } = req.body
+  console.log("🧪 force-upgrade appelé pour:", ownerUid)
+  if (!ownerUid) return res.status(400).json({ error: "ownerUid requis" })
+  try {
+    const userRef = db.collection("users").doc(ownerUid)
+    const snap = await userRef.get()
+    console.log("👤 User existe?", snap.exists, "| data:", JSON.stringify(snap.data()))
+    await userRef.update({
+      plan: "pro",
+      paye: true,
+      subscriptionActive: true,
+      updatedAt: Date.now()
+    })
+    console.log("✅ force-upgrade OK")
+    res.json({ ok: true, plan: "pro", paye: true })
+  } catch (err) {
+    console.error("❌ force-upgrade error:", err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+
+// ===============================================================
 // 💰 SAAS BUILDER (ABONNEMENT)
 // ===============================================================
 app.post("/create-billing-session", async (req, res) => {
