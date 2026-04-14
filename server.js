@@ -549,7 +549,7 @@ app.get("/api/orders/:storeUid", async (req, res) => {
 // ===============================================================
 //  POST /create-stripe-session — Paiement client du store
 // ===============================================================
-app.post("/create-stripe-session", async (req, res) => {
+app.post("/create-store-session", async (req, res) => {
   try {
     let {
       items, email, adresseLivraison, clientId,
