@@ -1,5 +1,5 @@
 // ===============================================================
-// BACKEND FINAL SAAS — VERSION DEBUG COMPLÈTE
+// BACKEND FINAL SAAS — VERSION DEBUG + SAFE FIX
 // ===============================================================
 
 import express from "express"
@@ -17,8 +17,12 @@ const PORT = process.env.PORT || 8080
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }))
 
 // ===============================================================
-// 🔥 FIREBASE
+// 🔥 FIREBASE INIT SAFE
 // ===============================================================
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+  throw new Error("FIREBASE_SERVICE_ACCOUNT manquant")
+}
+
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
 
 admin.initializeApp({
@@ -30,59 +34,60 @@ const db = admin.firestore()
 // ===============================================================
 // 💰 STRIPE
 // ===============================================================
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error("STRIPE_SECRET_KEY manquant")
+}
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 
 // ===============================================================
-// ⚠️ WEBHOOK
+// ⚠️ WEBHOOK (IMPORTANT raw body)
 // ===============================================================
-app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
-  const sig = req.headers["stripe-signature"]
+app.post(
+  "/webhook",
+  bodyParser.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"]
 
-  let event
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    )
-  } catch (err) {
-    console.error("❌ Webhook signature error:", err.message)
-    return res.status(400).send(`Webhook Error: ${err.message}`)
-  }
+    let event
 
-  console.log("📨 EVENT TYPE:", event.type)
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      )
+    } catch (err) {
+      console.error("❌ Webhook signature error:", err.message)
+      return res.status(400).send(`Webhook Error: ${err.message}`)
+    }
 
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object
+    console.log("📨 EVENT TYPE:", event.type)
 
-    console.log("🎯 SESSION ID:", session.id)
-    console.log("💳 payment_status:", session.payment_status)
-    console.log("📧 customer_email:", session.customer_email)
-    console.log("🗂 metadata RAW:", JSON.stringify(session.metadata))
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object
 
-    if (session.payment_status === "paid") {
+      if (session.payment_status !== "paid") {
+        console.log("⏳ Payment pas encore validé")
+        return res.json({ received: true })
+      }
 
       let metadata = {}
+
       try {
         metadata = session.metadata?.data
           ? JSON.parse(session.metadata.data)
           : {}
-        console.log("📦 METADATA PARSÉ:", JSON.stringify(metadata))
-      } catch (parseErr) {
-        console.error("❌ ERREUR PARSE METADATA:", parseErr.message)
+      } catch (e) {
+        console.error("❌ metadata parse error:", e.message)
       }
 
-      console.log("🔑 ownerUid:", metadata.ownerUid || "VIDE/UNDEFINED")
-      console.log("📋 type:", metadata.type || "VIDE/UNDEFINED")
-      console.log("🎫 plan:", metadata.plan || "VIDE/UNDEFINED")
+      console.log("🔑 metadata:", metadata)
 
       // =======================================================
-      // 💰 SAAS BUILDER
+      // 💰 BILLING
       // =======================================================
       if (metadata.type === "billing") {
-        console.log("✅ Type billing détecté")
-
-        // Écriture subscription
         try {
           await db.collection("subscriptions").doc(session.id).set({
             email: session.customer_email,
@@ -91,122 +96,84 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
             status: "active",
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
           })
-          console.log("✅ Subscription écrite dans Firestore")
+
+          const userRef = db.collection("users").doc(metadata.ownerUid)
+
+          await userRef.set(
+            {
+              plan: metadata.plan || "pro",
+              paye: true,
+              subscriptionActive: true,
+              updatedAt: Date.now(),
+            },
+            { merge: true }
+          )
+
+          console.log("🔥 USER UPGRADED")
         } catch (e) {
-          console.error("❌ Erreur écriture subscription:", e.message)
-        }
-
-        // Mise à jour user
-        if (!metadata.ownerUid) {
-          console.error("❌ FATAL: ownerUid vide — impossible de mettre à jour l'utilisateur")
-        } else {
-          try {
-            const userRef = db.collection("users").doc(metadata.ownerUid)
-            const userSnap = await userRef.get()
-            console.log("👤 User trouvé?", userSnap.exists, "| uid:", metadata.ownerUid)
-
-            if (userSnap.exists) {
-              console.log("📄 Données actuelles:", JSON.stringify(userSnap.data()))
-              await userRef.update({
-                plan: metadata.plan || "pro",
-                paye: true,
-                subscriptionActive: true,
-                updatedAt: Date.now()
-              })
-              console.log("🔥 USER PASSÉ EN PRO — plan:", metadata.plan || "pro")
-            } else {
-              console.error("❌ USER INTROUVABLE pour uid:", metadata.ownerUid)
-              // Tentative de création si inexistant
-              await userRef.set({
-                plan: metadata.plan || "pro",
-                paye: true,
-                subscriptionActive: true,
-                email: session.customer_email,
-                updatedAt: Date.now()
-              }, { merge: true })
-              console.log("🆕 USER CRÉÉ/MERGÉ avec plan pro")
-            }
-          } catch (e) {
-            console.error("❌ Erreur update user:", e.message)
-          }
+          console.error("❌ billing error:", e.message)
         }
       }
 
       // =======================================================
-      // 🛒 SAAS GENERATOR (CLIENT → OWNER)
+      // 🛒 STORE PAYMENT
       // =======================================================
       if (metadata.type === "store_payment") {
         try {
           await db.collection("orders").doc(session.id).set({
             email: session.customer_email,
             items: metadata.items || [],
-            montant: session.amount_total / 100,
             ownerUid: metadata.ownerUid,
             status: "paid",
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
           })
-          console.log("🛒 COMMANDE STORE OK")
+
+          console.log("🛒 ORDER SAVED")
         } catch (e) {
-          console.error("❌ Erreur commande store:", e.message)
+          console.error("❌ order error:", e.message)
         }
       }
-
-    } else {
-      console.log("⏳ payment_status pas encore 'paid':", session.payment_status)
     }
+
+    res.json({ received: true })
   }
-
-  res.json({ received: true })
-})
+)
 
 // ===============================================================
-app.use(express.json())
-
-// ===============================================================
-// 🧪 ROUTE TEST
-// ===============================================================
-app.get("/test", (req, res) => {
-  res.json({ ok: true, message: "Backend Railway opérationnel" })
-})
-
-// ===============================================================
-// 🧪 FORCER MISE À JOUR USER — TEST UNIQUEMENT
-// POST /force-upgrade { "ownerUid": "xxx" }
+// 🧪 FORCE UPGRADE
 // ===============================================================
 app.post("/force-upgrade", async (req, res) => {
   const { ownerUid } = req.body
-  console.log("🧪 force-upgrade appelé pour:", ownerUid)
-  if (!ownerUid) return res.status(400).json({ error: "ownerUid requis" })
+
+  if (!ownerUid) {
+    return res.status(400).json({ error: "ownerUid requis" })
+  }
+
   try {
-    const userRef = db.collection("users").doc(ownerUid)
-    const snap = await userRef.get()
-    console.log("👤 User existe?", snap.exists, "| data:", JSON.stringify(snap.data()))
-    await userRef.update({
-      plan: "pro",
-      paye: true,
-      subscriptionActive: true,
-      updatedAt: Date.now()
-    })
-    console.log("✅ force-upgrade OK")
-    res.json({ ok: true, plan: "pro", paye: true })
+    await db.collection("users").doc(ownerUid).set(
+      {
+        plan: "pro",
+        paye: true,
+        subscriptionActive: true,
+        updatedAt: Date.now(),
+      },
+      { merge: true }
+    )
+
+    res.json({ ok: true })
   } catch (err) {
-    console.error("❌ force-upgrade error:", err.message)
     res.status(500).json({ error: err.message })
   }
 })
 
-
 // ===============================================================
-// 💰 SAAS BUILDER (ABONNEMENT)
+// 💳 CREATE BILLING SESSION
 // ===============================================================
 app.post("/create-billing-session", async (req, res) => {
   try {
     const { email, plan, ownerUid } = req.body
 
-    console.log("💳 create-billing-session — email:", email, "| plan:", plan, "| ownerUid:", ownerUid)
-
     if (!ownerUid) {
-      console.error("❌ ownerUid manquant dans la requête!")
       return res.status(400).json({ error: "ownerUid requis" })
     }
 
@@ -215,75 +182,114 @@ app.post("/create-billing-session", async (req, res) => {
       pro: 1500,
     }
 
-    const metadataPayload = {
-      type: "billing",
-      plan,
-      ownerUid,
-    }
-    console.log("📦 Metadata envoyée à Stripe:", JSON.stringify(metadataPayload))
-
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
       customer_email: email,
 
-      line_items: [{
-        price_data: {
-          currency: "eur",
-          product_data: {
-            name: `Abonnement ${plan}`,
+      line_items: [
+        {
+          price_data: {
+            currency: "eur",
+            product_data: {
+              name: `Abonnement ${plan}`,
+            },
+            unit_amount: prices[plan] || 1500,
           },
-          unit_amount: prices[plan] || 1500,
+          quantity: 1,
         },
-        quantity: 1,
-      }],
+      ],
 
       mode: "payment",
 
-      // ✅ Redirige vers /dashboard?success=true pour déclencher le polling
-      success_url: "https://musrh.github.io/SaasBuilder/#/dashboard?success=true",
+      success_url:
+        "https://musrh.github.io/SaasBuilder/#/dashboard?success=true",
       cancel_url: "https://musrh.github.io/SaasBuilder/#/dashboard",
 
       metadata: {
-        data: JSON.stringify(metadataPayload),
+        data: JSON.stringify({
+          type: "billing",
+          plan,
+          ownerUid,
+        }),
       },
     })
 
-    console.log("✅ Session Stripe créée:", session.id)
     res.json({ url: session.url })
-
   } catch (err) {
-    console.error("❌ create-billing-session error:", err.message)
+    console.error(err)
     res.status(500).json({ error: err.message })
   }
 })
 
 // ===============================================================
-// 🛒 SAAS GENERATOR (CLIENT)
+// 🛒 CREATE STORE SESSION (FIXED + SAFE)
 // ===============================================================
 app.post("/create-store-session", async (req, res) => {
   try {
+    console.log("📩 BODY:", req.body)
+
     const { items, email, ownerUid } = req.body
 
-    const userDoc = await db.collection("users").doc(ownerUid).get()
+    // =====================================================
+    // 🔴 VALIDATION SAFE
+    // =====================================================
+    if (!ownerUid?.trim()) {
+      return res.status(400).json({ error: "ownerUid requis" })
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Panier vide" })
+    }
+
+    if (!email) {
+      return res.status(400).json({ error: "email requis" })
+    }
+
+    // =====================================================
+    // 🔴 USER CHECK
+    // =====================================================
+    const userRef = db.collection("users").doc(ownerUid)
+    const userDoc = await userRef.get()
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: "Utilisateur introuvable" })
+    }
+
     const accountId = userDoc.data()?.stripeAccountId
 
     if (!accountId) {
       return res.status(400).json({ error: "Stripe non connecté" })
     }
 
+    // =====================================================
+    // 🔴 VALIDATION ITEMS
+    // =====================================================
+    const lineItems = items.map((item) => {
+      if (!item.nom || item.prix == null || !item.quantity) {
+        throw new Error("Item invalide")
+      }
+
+      const price = Number(item.prix)
+      if (isNaN(price)) throw new Error("Prix invalide")
+
+      return {
+        price_data: {
+          currency: "eur",
+          product_data: { name: item.nom },
+          unit_amount: Math.round(price * 100),
+        },
+        quantity: Number(item.quantity),
+      }
+    })
+
+    // =====================================================
+    // 🔴 STRIPE SESSION
+    // =====================================================
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
       customer_email: email,
 
-      line_items: items.map(item => ({
-        price_data: {
-          currency: "eur",
-          product_data: { name: item.nom },
-          unit_amount: Math.round(item.prix * 100),
-        },
-        quantity: item.quantity,
-      })),
-
+      line_items: lineItems,
       mode: "payment",
 
       payment_intent_data: {
@@ -292,8 +298,10 @@ app.post("/create-store-session", async (req, res) => {
         },
       },
 
-      success_url: "https://musrh.github.io/SaaasGenerator/#/success",
-      cancel_url: "https://musrh.github.io/SaaasGenerator/#/cancel",
+      success_url:
+        "https://musrh.github.io/SaaasGenerator/#/success",
+      cancel_url:
+        "https://musrh.github.io/SaaasGenerator/#/cancel",
 
       metadata: {
         data: JSON.stringify({
@@ -304,11 +312,15 @@ app.post("/create-store-session", async (req, res) => {
       },
     })
 
-    res.json({ url: session.url })
+    console.log("✅ SESSION:", session.id)
 
+    res.json({ url: session.url })
   } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: err.message })
+    console.error("❌ STORE ERROR:", err.message)
+
+    res.status(500).json({
+      error: err.message || "Erreur serveur",
+    })
   }
 })
 
@@ -322,11 +334,9 @@ app.post("/create-connect-account", async (req, res) => {
     const userRef = db.collection("users").doc(ownerUid)
     const userDoc = await userRef.get()
 
-    let accountId
+    let accountId = userDoc.data()?.stripeAccountId
 
-    if (userDoc.exists && userDoc.data().stripeAccountId) {
-      accountId = userDoc.data().stripeAccountId
-    } else {
+    if (!accountId) {
       const account = await stripe.accounts.create({
         type: "express",
         email,
@@ -334,18 +344,22 @@ app.post("/create-connect-account", async (req, res) => {
 
       accountId = account.id
 
-      await userRef.set({ stripeAccountId: accountId }, { merge: true })
+      await userRef.set(
+        { stripeAccountId: accountId },
+        { merge: true }
+      )
     }
 
     const link = await stripe.accountLinks.create({
       account: accountId,
-      refresh_url: "https://musrh.github.io/SaasBuilder/#/reauth",
-      return_url: "https://musrh.github.io/SaasBuilder/#/dashboard",
+      refresh_url:
+        "https://musrh.github.io/SaasBuilder/#/reauth",
+      return_url:
+        "https://musrh.github.io/SaasBuilder/#/dashboard",
       type: "account_onboarding",
     })
 
     res.json({ url: link.url })
-
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: err.message })
@@ -353,6 +367,12 @@ app.post("/create-connect-account", async (req, res) => {
 })
 
 // ===============================================================
+app.use(express.json())
+
+app.get("/test", (req, res) => {
+  res.json({ ok: true })
+})
+
 app.listen(PORT, () => {
-  console.log(`🚀 Backend prêt sur port ${PORT}`)
+  console.log("🚀 Backend running on", PORT)
 })
