@@ -1,5 +1,5 @@
 // ===============================================================
-// BACKEND FINAL SAAS — VERSION ARCHI PROPRE
+// BACKEND FINAL SAAS — VERSION FIX + PRODUCTION SAFE
 // ===============================================================
 
 import express from "express"
@@ -14,11 +14,19 @@ dotenv.config()
 const app = express()
 const PORT = process.env.PORT || 8080
 
+// ===============================================================
+// 🔥 MIDDLEWARE ORDER (CRITICAL FIX)
+// ===============================================================
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }))
+app.use(express.json()) // ✅ MUST BE BEFORE ROUTES
 
 // ===============================================================
 // 🔥 FIREBASE
 // ===============================================================
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+  throw new Error("FIREBASE_SERVICE_ACCOUNT missing")
+}
+
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
 
 admin.initializeApp({
@@ -30,99 +38,119 @@ const db = admin.firestore()
 // ===============================================================
 // 💰 STRIPE
 // ===============================================================
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error("STRIPE_SECRET_KEY missing")
+}
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 
 // ===============================================================
-// ⚠️ WEBHOOK
+// ⚠️ WEBHOOK (RAW BODY MUST STAY FIRST)
 // ===============================================================
-app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
-  const sig = req.headers["stripe-signature"]
+app.post(
+  "/webhook",
+  bodyParser.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"]
 
-  let event
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    )
-  } catch (err) {
-    console.error("❌ Webhook error:", err.message)
-    return res.status(400).send(`Webhook Error: ${err.message}`)
-  }
+    let event
 
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      )
+    } catch (err) {
+      console.error("❌ Webhook error:", err.message)
+      return res.status(400).send(`Webhook Error: ${err.message}`)
+    }
 
-    if (session.payment_status === "paid") {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object
 
-      const metadata = session.metadata?.data
-        ? JSON.parse(session.metadata.data)
-        : {}
+      if (session.payment_status !== "paid") {
+        return res.json({ received: true })
+      }
+
+      let metadata = {}
+
+      try {
+        metadata = session.metadata?.data
+          ? JSON.parse(session.metadata.data)
+          : {}
+      } catch (e) {
+        console.error("❌ metadata parse error:", e.message)
+      }
 
       console.log("📦 METADATA:", metadata)
 
       // =======================================================
-      // 💰 SAAS BUILDER (OWNER → TOI)
+      // 💰 BILLING
       // =======================================================
       if (metadata.type === "billing") {
-
-        await db.collection("subscriptions").doc(session.id).set({
-          email: session.customer_email,
-          plan: metadata.plan,
-          ownerUid: metadata.ownerUid,
-          status: "active",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        })
-
-        // 🔥 UPDATE USER (LE FIX IMPORTANT)
-        const userRef = db.collection("users").doc(metadata.ownerUid)
-        const userSnap = await userRef.get()
-
-        if (userSnap.exists) {
-          await userRef.update({
-            plan: metadata.plan || "pro",
-            paye: true,
-            subscriptionActive: true,
-            updatedAt: Date.now()
+        try {
+          await db.collection("subscriptions").doc(session.id).set({
+            email: session.customer_email,
+            plan: metadata.plan,
+            ownerUid: metadata.ownerUid,
+            status: "active",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
           })
 
-          console.log("🔥 USER PASSÉ EN PRO")
-        } else {
-          console.error("❌ USER INTROUVABLE")
+          const userRef = db.collection("users").doc(metadata.ownerUid)
+
+          await userRef.set(
+            {
+              plan: metadata.plan || "pro",
+              paye: true,
+              subscriptionActive: true,
+              updatedAt: Date.now(),
+            },
+            { merge: true }
+          )
+
+          console.log("🔥 USER UPDATED")
+        } catch (err) {
+          console.error("❌ billing error:", err.message)
         }
       }
 
       // =======================================================
-      // 🛒 SAAS GENERATOR (CLIENT → OWNER)
+      // 🛒 STORE PAYMENT
       // =======================================================
       if (metadata.type === "store_payment") {
+        try {
+          await db.collection("orders").doc(session.id).set({
+            email: session.customer_email,
+            items: metadata.items || [],
+            montant: session.amount_total / 100,
+            ownerUid: metadata.ownerUid,
+            status: "paid",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          })
 
-        await db.collection("orders").doc(session.id).set({
-          email: session.customer_email,
-          items: metadata.items || [],
-          montant: session.amount_total / 100,
-          ownerUid: metadata.ownerUid,
-          status: "paid",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        })
-
-        console.log("🛒 COMMANDE STORE OK")
+          console.log("🛒 ORDER SAVED")
+        } catch (err) {
+          console.error("❌ order error:", err.message)
+        }
       }
     }
+
+    res.json({ received: true })
   }
-
-  res.json({ received: true })
-})
+)
 
 // ===============================================================
-app.use(express.json())
-
-// ===============================================================
-// 💰 SAAS BUILDER (ABONNEMENT)
+// 💰 BILLING SESSION
 // ===============================================================
 app.post("/create-billing-session", async (req, res) => {
   try {
-    const { email, plan, ownerUid } = req.body
+    const { email, plan, ownerUid } = req.body || {}
+
+    if (!ownerUid) {
+      return res.status(400).json({ error: "ownerUid requis" })
+    }
 
     const prices = {
       basic: 500,
@@ -133,20 +161,21 @@ app.post("/create-billing-session", async (req, res) => {
       payment_method_types: ["card"],
       customer_email: email,
 
-      line_items: [{
-        price_data: {
-          currency: "eur",
-          product_data: {
-            name: `Abonnement ${plan}`,
+      line_items: [
+        {
+          price_data: {
+            currency: "eur",
+            product_data: {
+              name: `Abonnement ${plan}`,
+            },
+            unit_amount: prices[plan] || 1500,
           },
-          unit_amount: prices[plan],
+          quantity: 1,
         },
-        quantity: 1,
-      }],
+      ],
 
       mode: "payment",
 
-      // ✅ SaasBuilder (ton dashboard)
       success_url: "https://musrh.github.io/SaasBuilder/#/success",
       cancel_url: "https://musrh.github.io/SaasBuilder/#/dashboard",
 
@@ -160,40 +189,75 @@ app.post("/create-billing-session", async (req, res) => {
     })
 
     res.json({ url: session.url })
-
   } catch (err) {
-    console.error(err)
+    console.error("❌ billing error:", err.message)
     res.status(500).json({ error: err.message })
   }
 })
 
 // ===============================================================
-// 🛒 SAAS GENERATOR (CLIENT)
+// 🛒 STORE SESSION (FULL SAFE FIX)
 // ===============================================================
 app.post("/create-store-session", async (req, res) => {
   try {
-    const { items, email, ownerUid } = req.body
+    const body = req.body || {}
 
+    const { items, email, ownerUid } = body
+
+    // ================= VALIDATION =================
+    if (!ownerUid) {
+      return res.status(400).json({ error: "ownerUid requis" })
+    }
+
+    if (!email) {
+      return res.status(400).json({ error: "email requis" })
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Panier invalide" })
+    }
+
+    // ================= USER =================
     const userDoc = await db.collection("users").doc(ownerUid).get()
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: "Utilisateur introuvable" })
+    }
+
     const accountId = userDoc.data()?.stripeAccountId
 
     if (!accountId) {
       return res.status(400).json({ error: "Stripe non connecté" })
     }
 
+    // ================= LINE ITEMS SAFE =================
+    const lineItems = items.map((item, i) => {
+      if (!item?.nom || item?.prix == null || !item?.quantity) {
+        throw new Error(`Item invalide index ${i}`)
+      }
+
+      const price = Number(item.prix)
+
+      if (isNaN(price)) {
+        throw new Error(`Prix invalide index ${i}`)
+      }
+
+      return {
+        price_data: {
+          currency: "eur",
+          product_data: { name: item.nom },
+          unit_amount: Math.round(price * 100),
+        },
+        quantity: Number(item.quantity),
+      }
+    })
+
+    // ================= STRIPE =================
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
       customer_email: email,
 
-      line_items: items.map(item => ({
-        price_data: {
-          currency: "eur",
-          product_data: { name: item.nom },
-          unit_amount: Math.round(item.prix * 100),
-        },
-        quantity: item.quantity,
-      })),
-
+      line_items: lineItems,
       mode: "payment",
 
       payment_intent_data: {
@@ -202,7 +266,6 @@ app.post("/create-store-session", async (req, res) => {
         },
       },
 
-      // ✅ SaaasGenerator (store client)
       success_url: "https://musrh.github.io/SaaasGenerator/#/success",
       cancel_url: "https://musrh.github.io/SaaasGenerator/#/cancel",
 
@@ -216,9 +279,8 @@ app.post("/create-store-session", async (req, res) => {
     })
 
     res.json({ url: session.url })
-
   } catch (err) {
-    console.error(err)
+    console.error("❌ STORE ERROR:", err.message)
     res.status(500).json({ error: err.message })
   }
 })
@@ -228,16 +290,18 @@ app.post("/create-store-session", async (req, res) => {
 // ===============================================================
 app.post("/create-connect-account", async (req, res) => {
   try {
-    const { ownerUid, email } = req.body
+    const { ownerUid, email } = req.body || {}
+
+    if (!ownerUid) {
+      return res.status(400).json({ error: "ownerUid requis" })
+    }
 
     const userRef = db.collection("users").doc(ownerUid)
     const userDoc = await userRef.get()
 
-    let accountId
+    let accountId = userDoc.data()?.stripeAccountId
 
-    if (userDoc.exists && userDoc.data().stripeAccountId) {
-      accountId = userDoc.data().stripeAccountId
-    } else {
+    if (!accountId) {
       const account = await stripe.accounts.create({
         type: "express",
         email,
@@ -256,15 +320,13 @@ app.post("/create-connect-account", async (req, res) => {
     })
 
     res.json({ url: link.url })
-
   } catch (err) {
-    console.error(err)
+    console.error("❌ connect error:", err.message)
     res.status(500).json({ error: err.message })
   }
 })
 
 // ===============================================================
 app.listen(PORT, () => {
-  console.log(`🚀 Backend prêt`)
+  console.log("🚀 Backend running on port", PORT)
 })
-
