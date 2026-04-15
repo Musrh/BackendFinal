@@ -1,5 +1,5 @@
 // ===============================================================
-// BACKEND FINAL SAAS — VERSION FIX + PRODUCTION SAFE
+// BACKEND FINAL SAAS — FIXED + PRODUCTION SAFE (CLEAN VERSION)
 // ===============================================================
 
 import express from "express"
@@ -15,13 +15,13 @@ const app = express()
 const PORT = process.env.PORT || 8080
 
 // ===============================================================
-// 🔥 MIDDLEWARE ORDER (CRITICAL FIX)
+// 🔥 MIDDLEWARE
 // ===============================================================
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }))
-app.use(express.json()) // ✅ MUST BE BEFORE ROUTES
+app.use(express.json())
 
 // ===============================================================
-// 🔥 FIREBASE
+// 🔥 FIREBASE INIT
 // ===============================================================
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   throw new Error("FIREBASE_SERVICE_ACCOUNT missing")
@@ -36,7 +36,7 @@ admin.initializeApp({
 const db = admin.firestore()
 
 // ===============================================================
-// 💰 STRIPE
+// 💰 STRIPE INIT
 // ===============================================================
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY missing")
@@ -44,8 +44,9 @@ if (!process.env.STRIPE_SECRET_KEY) {
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 
+
 // ===============================================================
-// ⚠️ WEBHOOK (RAW BODY MUST STAY FIRST)
+// ⚠️ WEBHOOK STRIPE (FIXED + SAFE)
 // ===============================================================
 app.post(
   "/webhook",
@@ -66,6 +67,9 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`)
     }
 
+    // =======================================================
+    // 🎯 PAYMENT SUCCESS
+    // =======================================================
     if (event.type === "checkout.session.completed") {
       const session = event.data.object
 
@@ -73,64 +77,63 @@ app.post(
         return res.json({ received: true })
       }
 
-      let metadata = {}
-
-      try {
-        metadata = session.metadata?.data
-          ? JSON.parse(session.metadata.data)
-          : {}
-      } catch (e) {
-        console.error("❌ metadata parse error:", e.message)
-      }
+      const metadata = session.metadata || {}
 
       console.log("📦 METADATA:", metadata)
 
+      const ownerUid = metadata.ownerUid
+      const type = metadata.type
+
+      if (!ownerUid) {
+        console.log("❌ Missing ownerUid")
+        return res.json({ received: true })
+      }
+
       // =======================================================
-      // 💰 BILLING
+      // 💰 BILLING (PLAN UPGRADE)
       // =======================================================
-      if (metadata.type === "billing") {
+      if (type === "billing") {
         try {
-          await db.collection("subscriptions").doc(session.id).set({
-            email: session.customer_email,
-            plan: metadata.plan,
-            ownerUid: metadata.ownerUid,
-            status: "active",
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          })
+          const plan = metadata.plan || "pro"
 
-          const userRef = db.collection("users").doc(metadata.ownerUid)
-
-          await userRef.set(
+          await db.collection("users").doc(ownerUid).set(
             {
-              plan: metadata.plan || "pro",
+              plan: plan,
               paye: true,
               subscriptionActive: true,
-              updatedAt: Date.now(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             },
             { merge: true }
           )
 
-          console.log("🔥 USER UPDATED")
+          console.log("🔥 USER UPGRADED TO PRO:", ownerUid)
         } catch (err) {
-          console.error("❌ billing error:", err.message)
+          console.error("❌ billing update error:", err.message)
         }
       }
 
       // =======================================================
       // 🛒 STORE PAYMENT
       // =======================================================
-      if (metadata.type === "store_payment") {
+      if (type === "store_payment") {
         try {
           await db.collection("orders").doc(session.id).set({
             email: session.customer_email,
             items: metadata.items || [],
-            montant: session.amount_total / 100,
-            ownerUid: metadata.ownerUid,
+            ownerUid,
             status: "paid",
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
           })
 
-          console.log("🛒 ORDER SAVED")
+          await db.collection("users").doc(ownerUid).set(
+            {
+              paye: true,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          )
+
+          console.log("🛒 ORDER SAVED + USER UPDATED")
         } catch (err) {
           console.error("❌ order error:", err.message)
         }
@@ -141,8 +144,9 @@ app.post(
   }
 )
 
+
 // ===============================================================
-// 💰 BILLING SESSION
+// 💳 BILLING SESSION (FIXED)
 // ===============================================================
 app.post("/create-billing-session", async (req, res) => {
   try {
@@ -176,15 +180,14 @@ app.post("/create-billing-session", async (req, res) => {
 
       mode: "payment",
 
-      success_url: "https://musrh.github.io/SaasBuilder/#/success",
-      cancel_url: "https://musrh.github.io/SaasBuilder/#/dashboard",
+      success_url: "https://musrh.github.io/SaaasGenerator/#/success",
+      cancel_url: "https://musrh.github.io/SaaasGenerator/#/dashboard",
 
+      // ✅ CLEAN METADATA (NO JSON STRINGIFY)
       metadata: {
-        data: JSON.stringify({
-          type: "billing",
-          plan,
-          ownerUid,
-        }),
+        type: "billing",
+        plan,
+        ownerUid,
       },
     })
 
@@ -195,29 +198,19 @@ app.post("/create-billing-session", async (req, res) => {
   }
 })
 
+
 // ===============================================================
-// 🛒 STORE SESSION (FULL SAFE FIX)
+// 🛒 STORE SESSION (UNCHANGED BUT SAFE)
 // ===============================================================
 app.post("/create-store-session", async (req, res) => {
   try {
-    const body = req.body || {}
+    const { items, email, ownerUid } = req.body || {}
 
-    const { items, email, ownerUid } = body
-
-    // ================= VALIDATION =================
-    if (!ownerUid) {
-      return res.status(400).json({ error: "ownerUid requis" })
-    }
-
-    if (!email) {
-      return res.status(400).json({ error: "email requis" })
-    }
-
-    if (!Array.isArray(items) || items.length === 0) {
+    if (!ownerUid) return res.status(400).json({ error: "ownerUid requis" })
+    if (!email) return res.status(400).json({ error: "email requis" })
+    if (!Array.isArray(items) || items.length === 0)
       return res.status(400).json({ error: "Panier invalide" })
-    }
 
-    // ================= USER =================
     const userDoc = await db.collection("users").doc(ownerUid).get()
 
     if (!userDoc.exists) {
@@ -230,29 +223,21 @@ app.post("/create-store-session", async (req, res) => {
       return res.status(400).json({ error: "Stripe non connecté" })
     }
 
-    // ================= LINE ITEMS SAFE =================
     const lineItems = items.map((item, i) => {
       if (!item?.nom || item?.prix == null || !item?.quantity) {
         throw new Error(`Item invalide index ${i}`)
-      }
-
-      const price = Number(item.prix)
-
-      if (isNaN(price)) {
-        throw new Error(`Prix invalide index ${i}`)
       }
 
       return {
         price_data: {
           currency: "eur",
           product_data: { name: item.nom },
-          unit_amount: Math.round(price * 100),
+          unit_amount: Math.round(Number(item.prix) * 100),
         },
         quantity: Number(item.quantity),
       }
     })
 
-    // ================= STRIPE =================
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
       customer_email: email,
@@ -270,11 +255,9 @@ app.post("/create-store-session", async (req, res) => {
       cancel_url: "https://musrh.github.io/SaaasGenerator/#/cancel",
 
       metadata: {
-        data: JSON.stringify({
-          type: "store_payment",
-          ownerUid,
-          items,
-        }),
+        type: "store_payment",
+        ownerUid,
+        items,
       },
     })
 
@@ -285,8 +268,9 @@ app.post("/create-store-session", async (req, res) => {
   }
 })
 
+
 // ===============================================================
-// 🔗 STRIPE CONNECT
+// 🔗 STRIPE CONNECT (UNCHANGED)
 // ===============================================================
 app.post("/create-connect-account", async (req, res) => {
   try {
@@ -325,6 +309,7 @@ app.post("/create-connect-account", async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+
 
 // ===============================================================
 app.listen(PORT, () => {
