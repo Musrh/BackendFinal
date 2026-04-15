@@ -1,5 +1,5 @@
 // ===============================================================
-// BACKEND FINAL SAAS — FIXED + PRODUCTION SAFE (CLEAN VERSION)
+// BACKEND FINAL SAAS — FIXED (UID + WEBHOOK + URL CLEAN)
 // ===============================================================
 
 import express from "express"
@@ -15,13 +15,13 @@ const app = express()
 const PORT = process.env.PORT || 8080
 
 // ===============================================================
-// 🔥 MIDDLEWARE
+// MIDDLEWARE
 // ===============================================================
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }))
 app.use(express.json())
 
 // ===============================================================
-// 🔥 FIREBASE INIT
+// FIREBASE
 // ===============================================================
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   throw new Error("FIREBASE_SERVICE_ACCOUNT missing")
@@ -36,7 +36,7 @@ admin.initializeApp({
 const db = admin.firestore()
 
 // ===============================================================
-// 💰 STRIPE INIT
+// STRIPE
 // ===============================================================
 if (!process.env.STRIPE_SECRET_KEY) {
   throw new Error("STRIPE_SECRET_KEY missing")
@@ -46,59 +46,57 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 
 
 // ===============================================================
-// ⚠️ WEBHOOK STRIPE (FIXED + SAFE)
+// 🔥 WEBHOOK STRIPE (FIXED UID + SAFE)
 // ===============================================================
 app.post(
   "/webhook",
   bodyParser.raw({ type: "application/json" }),
   async (req, res) => {
-    const sig = req.headers["stripe-signature"]
-
     let event
 
     try {
       event = stripe.webhooks.constructEvent(
         req.body,
-        sig,
+        req.headers["stripe-signature"],
         process.env.STRIPE_WEBHOOK_SECRET
       )
     } catch (err) {
       console.error("❌ Webhook error:", err.message)
-      return res.status(400).send(`Webhook Error: ${err.message}`)
+      return res.status(400).send(err.message)
     }
 
     // =======================================================
-    // 🎯 PAYMENT SUCCESS
+    // PAYMENT SUCCESS
     // =======================================================
     if (event.type === "checkout.session.completed") {
       const session = event.data.object
 
-      if (session.payment_status !== "paid") {
-        return res.json({ received: true })
-      }
-
       const metadata = session.metadata || {}
 
-      console.log("📦 METADATA:", metadata)
+      // 🔥 FIX CRITICAL UID (ownerUid / ownerId / uid)
+      const uid =
+        metadata.ownerUid ||
+        metadata.ownerId ||
+        metadata.uid
 
-      const ownerUid = metadata.ownerUid
       const type = metadata.type
 
-      if (!ownerUid) {
-        console.log("❌ Missing ownerUid")
+      console.log("🔥 UID FOUND:", uid)
+      console.log("📦 METADATA:", metadata)
+
+      if (!uid) {
+        console.log("❌ UID missing → abort")
         return res.json({ received: true })
       }
 
       // =======================================================
-      // 💰 BILLING (PLAN UPGRADE)
+      // 💰 BILLING (UPGRADE PLAN)
       // =======================================================
       if (type === "billing") {
         try {
-          const plan = metadata.plan || "pro"
-
-          await db.collection("users").doc(ownerUid).set(
+          await db.collection("users").doc(uid).set(
             {
-              plan: plan,
+              plan: "pro",
               paye: true,
               subscriptionActive: true,
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -106,7 +104,7 @@ app.post(
             { merge: true }
           )
 
-          console.log("🔥 USER UPGRADED TO PRO:", ownerUid)
+          console.log("🔥 USER UPGRADED TO PRO:", uid)
         } catch (err) {
           console.error("❌ billing update error:", err.message)
         }
@@ -120,12 +118,12 @@ app.post(
           await db.collection("orders").doc(session.id).set({
             email: session.customer_email,
             items: metadata.items || [],
-            ownerUid,
+            ownerUid: uid,
             status: "paid",
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
           })
 
-          await db.collection("users").doc(ownerUid).set(
+          await db.collection("users").doc(uid).set(
             {
               paye: true,
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -180,14 +178,15 @@ app.post("/create-billing-session", async (req, res) => {
 
       mode: "payment",
 
-      success_url: "https://musrh.github.io/SaaasGenerator/#/success",
-      cancel_url: "https://musrh.github.io/SaaasGenerator/#/dashboard",
+      // ✅ FIXED URLs (SaasBuilder)
+      success_url: "https://musrh.github.io/SaasBuilder/#/success",
+      cancel_url: "https://musrh.github.io/SaasBuilder/#/dashboard",
 
       // ✅ CLEAN METADATA (NO JSON STRINGIFY)
       metadata: {
         type: "billing",
         plan,
-        ownerUid,
+        ownerUid, // IMPORTANT FIX
       },
     })
 
@@ -251,8 +250,9 @@ app.post("/create-store-session", async (req, res) => {
         },
       },
 
-      success_url: "https://musrh.github.io/SaaasGenerator/#/success",
-      cancel_url: "https://musrh.github.io/SaaasGenerator/#/cancel",
+      // ✅ FIXED URLs
+      success_url: "https://musrh.github.io/SaasBuilder/#/success",
+      cancel_url: "https://musrh.github.io/SaasBuilder/#/cancel",
 
       metadata: {
         type: "store_payment",
