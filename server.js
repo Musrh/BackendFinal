@@ -627,30 +627,60 @@ app.get("/api/orders/:storeUid", async (req, res) => {
 // ===============================================================
 //  POST /create-stripe-session — Paiement client du store
 // ===============================================================
+// Convertir symbole devise → code ISO Stripe
+const normalizeCurrency = (raw) => {
+  if (!raw) return "eur"
+  const str = String(raw).trim().toLowerCase()
+  // Déjà un code ISO valide (3 lettres)
+  if (/^[a-z]{3}$/.test(str)) return str
+  // Mapper les symboles courants
+  const map = {
+    "€": "eur", "$": "usd", "£": "gbp",
+    "¥": "jpy", "₣": "chf", "＄": "usd",
+    "د.م.": "mad", "dh": "mad", "mad": "mad",
+    "cad": "cad", "aud": "aud", "chf": "chf",
+    "dz": "dzd", "tn": "tnd",
+  }
+  return map[str] || map[raw.trim()] || "eur"  // fallback eur
+}
+
 app.post("/create-store-session", async (req, res) => {
   try {
     let {
       items, email, adresseLivraison, clientId,
-      siteSlug, ownerUid, plan, storeName,
+      siteSlug, ownerUid, storeUid, plan, storeName,
       successUrl, cancelUrl, currency, description,
     } = req.body
 
-    console.log("📦 create-stripe-session — items:", items?.length, "| email:", email)
+    // ownerUid peut aussi venir sous storeUid
+    ownerUid = ownerUid || storeUid || clientId || ""
+
+    console.log("📦 create-store-session — items:", items?.length, "| email:", email, "| ownerUid:", ownerUid)
 
     items = (items || []).map(item => ({
       nom:      item.nom      || item.name  || item.title || "Produit",
       prix:     parseFloat(item.prix || item.price || item.unit_amount || 0),
       quantity: item.quantity || item.qty   || 1,
+      currency: item.currency || item.devise || currency || "€",
     }))
 
     if (!items.length) return res.status(400).json({ error: "Panier vide" })
+
+    // Devise ISO depuis le premier item ou le paramètre currency
+    const rawCurrency = items[0]?.currency || currency || "eur"
+    const stripeCurrency = normalizeCurrency(rawCurrency)
+    console.log(`💱 Devise: "${rawCurrency}" → Stripe: "${stripeCurrency}"`)
+
+    // Vérifier que les prix sont valides
+    const invalidItem = items.find(i => !i.prix || i.prix <= 0)
+    if (invalidItem) return res.status(400).json({ error: `Prix invalide pour: ${invalidItem.nom}` })
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
       customer_email: email || undefined,
       line_items: items.map(item => ({
         price_data: {
-          currency:     currency || "eur",
+          currency:     stripeCurrency,
           product_data: { name: item.nom },
           unit_amount:  Math.round(item.prix * 100),
         },
@@ -662,14 +692,15 @@ app.post("/create-store-session", async (req, res) => {
       metadata: {
         data: JSON.stringify({
           type:             "store_payment",
-          items,
+          items:            items.map(i => ({ nom: i.nom, prix: i.prix, quantity: i.quantity })),
           adresseLivraison: adresseLivraison || "",
           email:            email            || "",
-          clientId:         clientId         || ownerUid || "",
+          clientId:         clientId         || ownerUid,
           siteSlug:         siteSlug         || "",
-          ownerUid:         ownerUid         || clientId || "",
+          ownerUid:         ownerUid,
           plan:             plan             || "basic",
           storeName:        storeName        || "",
+          currency:         stripeCurrency,
         }),
       },
     })
@@ -678,9 +709,21 @@ app.post("/create-store-session", async (req, res) => {
     res.json({ url: session.url })
 
   } catch (err) {
-    console.error("❌ create-stripe-session:", err.message)
-    res.status(500).json({ error: "Stripe session failed", details: err.message })
+    console.error("❌ create-store-session:", err.message)
+    res.status(500).json({ error: err.message, details: err.message })
   }
+})
+
+
+// ===============================================================
+//  POST /create-stripe-session — Alias de create-store-session
+//  (SiteViewer appelle cfg.backendUrl qui pointe vers cette route)
+// ===============================================================
+app.post("/create-stripe-session", async (req, res, next) => {
+  // Même logique que /create-store-session
+  req.url = "/create-store-session"
+  // Re-router vers create-store-session
+  app._router.handle(req, res, next)
 })
 
 
