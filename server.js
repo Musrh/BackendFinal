@@ -1,5 +1,5 @@
 // ===============================================================
-//  server.js — Backend COMPLET SaasBuilder + SaaasGenerator
+//  server.js — Backend COMPLET SaasBuilder + SaasBuilder
 //  Version fusionnée finale
 //
 //  SaasBuilder (abonnements) :
@@ -7,7 +7,7 @@
 //    POST /create-connect-account   → Stripe Connect
 //    POST /force-upgrade            → debug upgrade plan
 //
-//  SaaasGenerator (store clients) :
+//  SaasBuilder (store clients) :
 //    POST /create-stripe-session    → paiement client du store
 //    POST /webhook                  → webhook Stripe (billing + store)
 //
@@ -64,8 +64,10 @@ const groq = new Groq({
   apiKey: process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY || ""
 })
 
-const FRONTEND_BUILDER   = "https://musrh.github.io/SaasBuilder"
-const FRONTEND_GENERATOR = "https://musrh.github.io/SaaasGenerator"
+// Un seul repo/domaine → toutes les URLs redirigent vers SaasBuilder
+const FRONTEND           = "https://musrh.github.io/SaasBuilder"
+const FRONTEND_BUILDER   = FRONTEND   // SaasBuilder (abonnements)
+const FRONTEND_GENERATOR = FRONTEND   // SaasBuilder (stores clients)
 
 
 // ===============================================================
@@ -871,7 +873,7 @@ app.post("/create-connect-account", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     status:   "OK",
-    service:  "SaasBuilder + SaaasGenerator Backend",
+    service:  "SaasBuilder + SaasBuilder Backend",
     groq:     process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY ? "✅ configuré" : "❌ clé manquante",
     firebase: serviceAccount ? "✅ configuré" : "❌ non configuré",
     stripe:   process.env.STRIPE_SECRET_KEY ? "✅ configuré" : "❌ clé manquante",
