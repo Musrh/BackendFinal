@@ -737,7 +737,7 @@ app.post("/create-billing-session", async (req, res) => {
     const { email, plan, ownerUid } = req.body
     if (!ownerUid) return res.status(400).json({ error: "ownerUid requis" })
 
-    const prices = { basic: 500, pro: 1500, premium: 2900 }
+    const prices = { basic:0, pro: 1000, premium: 2000 }
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -746,7 +746,7 @@ app.post("/create-billing-session", async (req, res) => {
         price_data: {
           currency: "eur",
           product_data: { name: `Abonnement ${plan || "pro"}` },
-          unit_amount: prices[plan] || 1500,
+          unit_amount: prices[plan] || 1000,
         },
         quantity: 1,
       }],
