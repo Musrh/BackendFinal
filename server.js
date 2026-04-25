@@ -157,6 +157,7 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
                   plan:               metadata.plan || "pro",
                   paye:               true,
                   subscriptionActive: true,
+                  expiry:             Date.now() + 30 * 24 * 60 * 60 * 1000,
                   updatedAt:          Date.now(),
                 }, { merge: true })
                 console.log("🔥 USER PASSÉ EN PRO (via ownerId):", foundDoc.id)
@@ -167,7 +168,9 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
                 if (!q2.empty) {
                   await q2.docs[0].ref.set({
                     plan: metadata.plan || "pro", paye: true,
-                    subscriptionActive: true, updatedAt: Date.now(),
+                    subscriptionActive: true,
+                    expiry:    Date.now() + 30 * 24 * 60 * 60 * 1000,
+                    updatedAt: Date.now(),
                   }, { merge: true })
                   console.log("🔥 USER PASSÉ EN PRO (via uid field):", q2.docs[0].id)
                 } else {
@@ -182,6 +185,7 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
                 plan:               metadata.plan || "pro",
                 paye:               true,
                 subscriptionActive: true,
+                expiry:             Date.now() + 30 * 24 * 60 * 60 * 1000,
                 updatedAt:          Date.now(),
               }, { merge: true })
               console.log("🔥 USER PASSÉ EN PRO (direct):", ownerUid)
@@ -195,7 +199,9 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
             if (!q.empty) {
               await q.docs[0].ref.set({
                 plan: metadata.plan || "pro", paye: true,
-                subscriptionActive: true, updatedAt: Date.now(),
+                subscriptionActive: true,
+                expiry:    Date.now() + 30 * 24 * 60 * 60 * 1000,
+                updatedAt: Date.now(),
               }, { merge: true })
               console.log("🔥 USER PASSÉ EN PRO (via email):", q.docs[0].id)
             } else {
@@ -737,7 +743,7 @@ app.post("/create-billing-session", async (req, res) => {
     const { email, plan, ownerUid } = req.body
     if (!ownerUid) return res.status(400).json({ error: "ownerUid requis" })
 
-    const prices = { basic:0, pro: 1000, premium: 2000 }
+    const prices = { basic: 500, pro: 1500, premium: 2900 }
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -746,7 +752,7 @@ app.post("/create-billing-session", async (req, res) => {
         price_data: {
           currency: "eur",
           product_data: { name: `Abonnement ${plan || "pro"}` },
-          unit_amount: prices[plan] || 1000,
+          unit_amount: prices[plan] || 1500,
         },
         quantity: 1,
       }],
@@ -790,7 +796,7 @@ app.post("/force-upgrade", async (req, res) => {
   if (!targetUid && !email) return res.status(400).json({ error: "ownerUid ou email requis" })
 
   try {
-    const update = { plan: targetPlan, paye: true, subscriptionActive: true, updatedAt: Date.now() }
+    const update = { plan: targetPlan, paye: true, subscriptionActive: true, expiry: Date.now() + 30 * 24 * 60 * 60 * 1000, updatedAt: Date.now() }
 
     if (targetUid) {
       // 1. Essai direct par document ID
