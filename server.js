@@ -212,38 +212,40 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
       }
 
       // ── COMMANDE STORE (PAIEMENT CLIENT) ─────────────────
+      // Routing : plan Pro/Premium → orders | plan Free → forders
       if (metadata.type === "store_payment") {
         try {
-          await db.collection("orders").doc(session.id).set({
-            email:     session.customer_email,
-            items:     metadata.items || [],
-            total:     (session.amount_total || 0) / 100,
-            ownerUid:  metadata.ownerUid,
-            clientId:  metadata.clientId || "",
-            siteSlug:  metadata.siteSlug || "",
-            adresseLivraison: metadata.adresseLivraison || "",
-            status:    "paid",
-            provider:  "stripe",
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          })
-          console.log("🛒 COMMANDE STORE OK:", session.id)
+          const isPro          = metadata.plan === "pro" || metadata.plan === "premium"
+          const rootCollection = isPro ? "orders" : "forders"
 
-          // Aussi dans users/{ownerUid}/orders
+          const orderData = {
+            email:            session.customer_email,
+            items:            metadata.items || [],
+            total:            (session.amount_total || 0) / 100,
+            ownerUid:         metadata.ownerUid,
+            clientId:         metadata.clientId  || "",
+            siteSlug:         metadata.siteSlug  || "",
+            adresseLivraison: metadata.adresseLivraison || "",
+            storeName:        metadata.storeName || "",
+            plan:             metadata.plan      || "free",
+            status:           "paid",
+            provider:         "stripe",
+            createdAt:        admin.firestore.FieldValue.serverTimestamp(),
+          }
+
+          // ── Collection racine : orders (Pro) ou forders (Free) ──
+          await db.collection(rootCollection).doc(session.id).set(orderData)
+          console.log(`🛒 COMMANDE STORE [${rootCollection}] OK:`, session.id, "| plan:", metadata.plan)
+
+          // ── Sous-collection users/{ownerUid}/orders (tous les plans) ──
           if (metadata.ownerUid) {
             try {
               await db.collection("users").doc(metadata.ownerUid)
-                .collection("orders").add({
-                  email:    session.customer_email,
-                  items:    metadata.items || [],
-                  total:    (session.amount_total || 0) / 100,
-                  ownerUid: metadata.ownerUid,
-                  clientId: metadata.clientId || "",
-                  status:   "paid",
-                  provider: "stripe",
-                  createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                })
-            } catch(e2) { console.warn("users/orders:", e2.message) }
+                .collection("orders").add(orderData)
+              console.log("🔗 users/orders enregistré pour:", metadata.ownerUid)
+            } catch(e2) { console.warn("⚠️ users/orders:", e2.message) }
           }
+
         } catch (e) { console.error("❌ commande store:", e.message) }
       }
     }
@@ -369,20 +371,27 @@ const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
       } catch(e) { console.warn("cmdinfos:", e.message) }
     }
 
-    // orders par clientId ou email
+    // orders (Pro) + forders (Free) par clientId ou email
     if (!results.length) {
-      try {
-        let q = db.collection("orders")
-        if (email) q = q.where("customerEmail", "==", email.trim().toLowerCase())
-        else if (storeUid) q = q.where("ownerUid", "==", storeUid)
-        const snap = await q.limit(20).get()
-        results = [...results, ...snap.docs.map(d => ({
-          id: d.id, ...d.data(),
-          customerName:  d.data().customerName  || d.data().name || "",
-          customerEmail: d.data().customerEmail || d.data().email || "",
-        }))]
-        console.log(`📋 orders: ${results.length}`)
-      } catch(e) { console.warn("orders fallback:", e.message) }
+      for (const col of ["orders", "forders"]) {
+        try {
+          let q = db.collection(col)
+          if (email) q = q.where("email", "==", email.trim().toLowerCase())
+          else if (storeUid) q = q.where("ownerUid", "==", storeUid)
+          const snap = await q.limit(20).get()
+          const ids  = new Set(results.map(r => r.id))
+          const docs = snap.docs
+            .filter(d => !ids.has(d.id))
+            .map(d => ({
+              id: d.id, ...d.data(),
+              customerName:  d.data().customerName  || d.data().name  || "",
+              customerEmail: d.data().customerEmail || d.data().email || "",
+              _source: col,
+            }))
+          results = [...results, ...docs]
+          console.log(`📋 ${col}: ${docs.length} commandes`)
+        } catch(e) { console.warn(`${col} fallback:`, e.message) }
+      }
     }
 
     // users/{storeUid}/orders
@@ -623,12 +632,42 @@ app.get("/api/products/:storeUid", async (req, res) => {
 
 
 // ===============================================================
-//  GET /api/orders/:storeUid
+//  GET /api/orders/:storeUid  — Commandes Pro (collection orders)
 // ===============================================================
 app.get("/api/orders/:storeUid", async (req, res) => {
   const { email, nom, date } = req.query
-  const cmds = await getCmdinfos(req.params.storeUid, { email, nom, date })
-  res.json({ commandes: cmds, count: cmds.length })
+  const storeUid = req.params.storeUid
+  try {
+    let q = db.collection("orders").where("ownerUid", "==", storeUid)
+    if (email) q = q.where("email", "==", email.trim().toLowerCase())
+    const snap = await q.orderBy("createdAt", "desc").limit(50).get()
+    const commandes = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+    res.json({ commandes, count: commandes.length, plan: "pro" })
+  } catch(e) {
+    const cmds = await getCmdinfos(storeUid, { email, nom, date })
+    res.json({ commandes: cmds, count: cmds.length })
+  }
+})
+
+
+// ===============================================================
+//  GET /api/forders/:storeUid  — Commandes Free (collection forders)
+// ===============================================================
+app.get("/api/forders/:storeUid", async (req, res) => {
+  const { email, nom, date } = req.query
+  const storeUid = req.params.storeUid
+  try {
+    let q = db.collection("forders").where("ownerUid", "==", storeUid)
+    if (email) q = q.where("email", "==", email.trim().toLowerCase())
+    const snap = await q.orderBy("createdAt", "desc").limit(50).get()
+    let commandes = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+    if (nom)  commandes = commandes.filter(c => (c.storeName||"").toLowerCase().includes(nom.toLowerCase()))
+    if (date) commandes = commandes.filter(c => String(c.createdAt||"").includes(date))
+    res.json({ commandes, count: commandes.length, plan: "free" })
+  } catch(e) {
+    console.error("❌ /api/forders:", e.message)
+    res.status(500).json({ error: e.message })
+  }
 })
 
 
@@ -893,6 +932,7 @@ app.get("/", (req, res) => {
       "POST /api/save-request",
       "GET  /api/products/:storeUid",
       "GET  /api/orders/:storeUid",
+      "GET  /api/forders/:storeUid",
       "GET  /api/debug/:storeUid",
     ]
   })
