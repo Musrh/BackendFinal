@@ -218,33 +218,38 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
           const isPro          = metadata.plan === "pro" || metadata.plan === "premium"
           const rootCollection = isPro ? "orders" : "forders"
 
+          // Normaliser les items : {nom/prix/quantity} → {name/price/qty}
+          const rawItems = metadata.items || []
+          const normItems = rawItems.map(i => ({
+            name:     i.name     || i.nom  || "Produit",
+            price:    i.price    !== undefined ? i.price : (i.prix !== undefined ? String(i.prix) : "0"),
+            qty:      i.qty      || i.quantity || 1,
+            currency: i.currency || metadata.currency || "€",
+            image:    i.image    || "",
+          }))
+
           const orderData = {
-            email:            session.customer_email,
-            items:            metadata.items || [],
+            customerEmail:    session.customer_email || metadata.email || "",
+            customerName:     metadata.customerName || "",
+            customerAddress:  metadata.adresseLivraison || metadata.customerAddress || "",
+            email:            session.customer_email || metadata.email || "",
+            items:            normItems,
             total:            (session.amount_total || 0) / 100,
-            ownerUid:         metadata.ownerUid,
+            currency:         metadata.currency || "€",
+            ownerUid:         metadata.ownerUid || "",
             clientId:         metadata.clientId  || "",
             siteSlug:         metadata.siteSlug  || "",
-            adresseLivraison: metadata.adresseLivraison || "",
             storeName:        metadata.storeName || "",
             plan:             metadata.plan      || "free",
             status:           "paid",
             provider:         "stripe",
-            createdAt:        admin.firestore.FieldValue.serverTimestamp(),
+            createdAt:        new Date().toISOString(),
           }
 
           // ── Collection racine : orders (Pro) ou forders (Free) ──
           await db.collection(rootCollection).doc(session.id).set(orderData)
           console.log(`🛒 COMMANDE STORE [${rootCollection}] OK:`, session.id, "| plan:", metadata.plan)
 
-          // ── Sous-collection users/{ownerUid}/orders (tous les plans) ──
-          if (metadata.ownerUid) {
-            try {
-              await db.collection("users").doc(metadata.ownerUid)
-                .collection("orders").add(orderData)
-              console.log("🔗 users/orders enregistré pour:", metadata.ownerUid)
-            } catch(e2) { console.warn("⚠️ users/orders:", e2.message) }
-          }
 
         } catch (e) { console.error("❌ commande store:", e.message) }
       }
