@@ -157,22 +157,25 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
                   plan:               metadata.plan || "pro",
                   paye:               true,
                   subscriptionActive: true,
+                  active:             true,
                   expiry:             Date.now() + 30 * 24 * 60 * 60 * 1000,
                   updatedAt:          Date.now(),
                 }, { merge: true })
-                console.log("🔥 USER PASSÉ EN PRO (via ownerId):", foundDoc.id)
+                console.log("🔥 USER PASSÉ EN PRO + RÉACTIVÉ (via ownerId):", foundDoc.id)
               } else {
                 // Chercher par champ uid
                 const q2 = await db.collection("users")
                   .where("uid", "==", ownerUid).limit(1).get()
                 if (!q2.empty) {
                   await q2.docs[0].ref.set({
-                    plan: metadata.plan || "pro", paye: true,
+                    plan:               metadata.plan || "pro",
+                    paye:               true,
                     subscriptionActive: true,
-                    expiry:    Date.now() + 30 * 24 * 60 * 60 * 1000,
-                    updatedAt: Date.now(),
+                    active:             true,
+                    expiry:             Date.now() + 30 * 24 * 60 * 60 * 1000,
+                    updatedAt:          Date.now(),
                   }, { merge: true })
-                  console.log("🔥 USER PASSÉ EN PRO (via uid field):", q2.docs[0].id)
+                  console.log("🔥 USER PASSÉ EN PRO + RÉACTIVÉ (via uid field):", q2.docs[0].id)
                 } else {
                   console.error("❌ USER INTROUVABLE pour ownerUid:", ownerUid)
                 }
@@ -185,10 +188,11 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
                 plan:               metadata.plan || "pro",
                 paye:               true,
                 subscriptionActive: true,
+                active:             true,
                 expiry:             Date.now() + 30 * 24 * 60 * 60 * 1000,
                 updatedAt:          Date.now(),
               }, { merge: true })
-              console.log("🔥 USER PASSÉ EN PRO (direct):", ownerUid)
+              console.log("🔥 USER PASSÉ EN PRO + RÉACTIVÉ (direct):", ownerUid)
             } catch (e) { console.error("❌ update user direct:", e.message) }
           }
         } else {
@@ -198,12 +202,14 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
               .where("email", "==", session.customer_email).limit(1).get()
             if (!q.empty) {
               await q.docs[0].ref.set({
-                plan: metadata.plan || "pro", paye: true,
+                plan:               metadata.plan || "pro",
+                paye:               true,
                 subscriptionActive: true,
-                expiry:    Date.now() + 30 * 24 * 60 * 60 * 1000,
-                updatedAt: Date.now(),
+                active:             true,
+                expiry:             Date.now() + 30 * 24 * 60 * 60 * 1000,
+                updatedAt:          Date.now(),
               }, { merge: true })
-              console.log("🔥 USER PASSÉ EN PRO (via email):", q.docs[0].id)
+              console.log("🔥 USER PASSÉ EN PRO + RÉACTIVÉ (via email):", q.docs[0].id)
             } else {
               console.error("❌ USER INTROUVABLE via email:", session.customer_email)
             }
