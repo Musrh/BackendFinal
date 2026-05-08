@@ -896,17 +896,38 @@ app.post("/force-upgrade", async (req, res) => {
 // ===============================================================
 app.post("/create-connect-account", async (req, res) => {
   try {
-    const { ownerUid, email } = req.body
+    const { ownerUid, email, country } = req.body   // ← country lu depuis le Dashboard
+
     const userRef = db.collection("users").doc(ownerUid)
     const userDoc = await userRef.get()
     let accountId = userDoc.exists && userDoc.data().stripeAccountId
       ? userDoc.data().stripeAccountId
       : null
 
+    // Si un compte Stripe Connect existe déjà, vérifier si le pays correspond.
+    // Stripe ne permet pas de changer le pays d'un compte existant → on en crée un nouveau.
+    if (accountId && country) {
+      try {
+        const existing = await stripe.accounts.retrieve(accountId)
+        if (existing.country && existing.country.toUpperCase() !== country.toUpperCase()) {
+          console.log(`🔄 Pays différent (existant: ${existing.country}, demandé: ${country}) → nouveau compte Stripe Connect`)
+          accountId = null  // forcer la création d'un nouveau compte
+        }
+      } catch (e) {
+        console.warn("⚠️ Récupération compte Stripe échouée (sera recréé):", e.message)
+        accountId = null
+      }
+    }
+
     if (!accountId) {
-      const account = await stripe.accounts.create({ type: "express", email })
+      const account = await stripe.accounts.create({
+        type:    "express",
+        email,
+        country: (country || "FR").toUpperCase(),   // ← pays choisi par l'utilisateur
+      })
       accountId = account.id
       await userRef.set({ stripeAccountId: accountId }, { merge: true })
+      console.log(`✅ Compte Stripe Connect créé: ${accountId} | pays: ${country || "FR"}`)
     }
 
     const link = await stripe.accountLinks.create({
@@ -918,6 +939,7 @@ app.post("/create-connect-account", async (req, res) => {
 
     res.json({ url: link.url })
   } catch (err) {
+    console.error("❌ create-connect-account:", err.message)
     res.status(500).json({ error: err.message })
   }
 })
