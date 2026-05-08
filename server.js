@@ -924,6 +924,10 @@ app.post("/create-connect-account", async (req, res) => {
         type:    "express",
         email,
         country: (country || "FR").toUpperCase(),   // ← pays choisi par l'utilisateur
+        capabilities: {
+          card_payments: { requested: true },
+          transfers:     { requested: true },
+        },
       })
       accountId = account.id
       await userRef.set({ stripeAccountId: accountId }, { merge: true })
