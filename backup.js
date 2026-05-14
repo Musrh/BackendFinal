@@ -2,7 +2,7 @@
 //  backup.js — Sauvegarde Firestore → Cloud Storage (ESM)
 // ================================================================
 
-import admin from "firebase-admin"
+//import admin from "firebase-admin"
 import { Storage } from "@google-cloud/storage"
 import fs from "fs"
 import path from "path"
