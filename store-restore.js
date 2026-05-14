@@ -161,4 +161,4 @@ const storeRestoreRoutes = (app) => {
 
 }
 
-module.exports = { storeRestoreRoutes }
+export { storeRestoreRoutes }
