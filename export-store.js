@@ -14,6 +14,8 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore()
 
+const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
+
 // ── Sérialiser les types Firestore ───────────────────────────────
 const serialize = (data) => {
   if (data === null || data === undefined) return null
@@ -62,15 +64,20 @@ const exportStore = async (ownerUid) => {
     .where("ownerUid", "==", ownerUid).get()
   const subscriptions = subSnap.docs.map(d => ({ id: d.id, ...serialize(d.data()) }))
 
+  // 7. Clients (customers) — ajouté pour cohérence avec backup.js
+  const custSnap = await db.collection("customers")
+    .where("ownerUid", "==", ownerUid).get()
+  const customers = custSnap.docs.map(d => ({ id: d.id, ...serialize(d.data()) }))
+
   // ── Assembler l'export ──────────────────────────────────────
   const exportData = {
     meta: {
-      exportedAt:  new Date().toISOString(),
+      exportedAt:    new Date().toISOString(),
       ownerUid,
-      siteName:    userData.siteName    || "",
+      siteName:      userData.siteName      || "",
       publishedSlug: userData.publishedSlug || "",
-      plan:        userData.plan        || "free",
-      version:     "1.0",
+      plan:          userData.plan          || "free",
+      version:       "1.0",
     },
     store: {
       user:          userData,
@@ -79,11 +86,13 @@ const exportStore = async (ownerUid) => {
       forders,
       prodinfos,
       subscriptions,
+      customers,
     },
     stats: {
       totalOrders:  orders.length + forders.length,
       proOrders:    orders.length,
       freeOrders:   forders.length,
+      customers:    customers.length,
       revenue:      [...orders, ...forders]
         .reduce((acc, o) => acc + parseFloat(o.total || 0), 0)
         .toFixed(2),
@@ -91,68 +100,61 @@ const exportStore = async (ownerUid) => {
   }
 
   console.log(`✅ Export terminé:`)
-  console.log(`   Site     : ${exportData.meta.siteName}`)
-  console.log(`   Slug     : ${exportData.meta.publishedSlug}`)
-  console.log(`   Plan     : ${exportData.meta.plan}`)
-  console.log(`   Commandes: ${exportData.stats.totalOrders} (${exportData.stats.proOrders} Pro / ${exportData.stats.freeOrders} Free)`)
-  console.log(`   Revenu   : ${exportData.stats.revenue} €`)
+  console.log(`   Site      : ${exportData.meta.siteName}`)
+  console.log(`   Slug      : ${exportData.meta.publishedSlug}`)
+  console.log(`   Plan      : ${exportData.meta.plan}`)
+  console.log(`   Commandes : ${exportData.stats.totalOrders} (${exportData.stats.proOrders} Pro / ${exportData.stats.freeOrders} Free)`)
+  console.log(`   Revenu    : ${exportData.stats.revenue} €`)
 
   return exportData
 }
 
 // ── Endpoint Express ────────────────────────────────────────────
 const exportStoreRoutes = (app) => {
+
+  const verifyAdmin = async (idToken) => {
+    if (!idToken) throw Object.assign(new Error("Non authentifié"), { status: 401 })
+    const decoded = await admin.auth().verifyIdToken(idToken)
+    if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase())) {
+      throw Object.assign(new Error("Non autorisé"), { status: 403 })
+    }
+  }
+
   // Export JSON d'un store
   app.get("/api/admin/export-store/:uid", async (req, res) => {
-    const { idToken } = req.query
-    if (!idToken) return res.status(401).json({ error: "Non authentifié" })
     try {
-      const decoded = await admin.auth().verifyIdToken(idToken)
-      const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
-      if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase())) {
-        return res.status(403).json({ error: "Non autorisé" })
-      }
-    } catch(e) { return res.status(401).json({ error: "Token invalide" }) }
-    try {
+      await verifyAdmin(req.query.idToken)
       const data     = await exportStore(req.params.uid)
       const filename = `store_${data.meta.publishedSlug || req.params.uid}_${Date.now()}.json`
       res.setHeader("Content-Type", "application/json")
       res.setHeader("Content-Disposition", `attachment; filename="${filename}"`)
       res.json(data)
-    } catch(e) {
-      res.status(500).json({ error: e.message })
+    } catch (e) {
+      res.status(e.status || 500).json({ error: e.message })
     }
   })
 
   // Export de TOUS les stores (admin global)
   app.get("/api/admin/export-all", async (req, res) => {
-    const { idToken } = req.query
-    if (!idToken) return res.status(401).json({ error: "Non authentifié" })
     try {
-      const decoded = await admin.auth().verifyIdToken(idToken)
-      const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
-      if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase())) {
-        return res.status(403).json({ error: "Non autorisé" })
-      }
-    } catch(e) { return res.status(401).json({ error: "Token invalide" }) }
-    try {
+      await verifyAdmin(req.query.idToken)
       const usersSnap = await db.collection("users").get()
       const exports   = []
       for (const doc of usersSnap.docs) {
         try {
           const data = await exportStore(doc.id)
           exports.push(data)
-        } catch(e) {
+        } catch (e) {
           exports.push({ meta: { ownerUid: doc.id }, error: e.message })
         }
       }
       res.json({
-        exportedAt: new Date().toISOString(),
+        exportedAt:  new Date().toISOString(),
         totalStores: exports.length,
-        stores: exports,
+        stores:      exports,
       })
-    } catch(e) {
-      res.status(500).json({ error: e.message })
+    } catch (e) {
+      res.status(e.status || 500).json({ error: e.message })
     }
   })
 }
@@ -170,7 +172,7 @@ if (require.main === module) {
       const filename = `store_${uid}_${Date.now()}.json`
       fs.writeFileSync(filename, JSON.stringify(data, null, 2))
       console.log(`💾 Sauvegardé dans: ${filename}`)
-    } catch(e) {
+    } catch (e) {
       console.error("Erreur:", e.message)
       process.exit(1)
     }
