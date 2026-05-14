@@ -9,7 +9,7 @@
 //    BACKUP_RETENTION_DAYS      (défaut: 30)
 // ================================================================
 
-const admin  = require("firebase-admin")
+import admin from "firebase-admin"
 const { Storage } = require("@google-cloud/storage")
 const fs     = require("fs")
 const path   = require("path")
