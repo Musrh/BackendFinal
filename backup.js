@@ -2,6 +2,11 @@
 //  backup.js — Sauvegarde Firestore → Cloud Storage
 //  Usage : node backup.js
 //  Cron  : 0 2 * * * node /app/backup.js   (tous les jours à 2h)
+//
+//  Variables d'env requises :
+//    FIREBASE_SERVICE_ACCOUNT   (JSON stringify)
+//    BACKUP_BUCKET              (ex: "saasbuilder-backups")
+//    BACKUP_RETENTION_DAYS      (défaut: 30)
 // ================================================================
 
 const admin  = require("firebase-admin")
@@ -10,9 +15,8 @@ const fs     = require("fs")
 const path   = require("path")
 
 // ── Config ──────────────────────────────────────────────────────
-const SERVICE_ACCOUNT = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-const BUCKET_NAME     = process.env.BACKUP_BUCKET || "saasbuilder-backups"
-const RETENTION_DAYS  = parseInt(process.env.BACKUP_RETENTION_DAYS || "30")
+const BUCKET_NAME    = process.env.BACKUP_BUCKET || "saasbuilder-backups"
+const RETENTION_DAYS = parseInt(process.env.BACKUP_RETENTION_DAYS || "30")
 
 // Collections à sauvegarder
 const COLLECTIONS = [
@@ -26,13 +30,23 @@ const COLLECTIONS = [
 ]
 
 // ── Init Firebase Admin ──────────────────────────────────────────
+// Initialiser uniquement si pas déjà fait (évite le conflit avec server.js)
 if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(SERVICE_ACCOUNT),
-  })
+  const SERVICE_ACCOUNT = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+  admin.initializeApp({ credential: admin.credential.cert(SERVICE_ACCOUNT) })
 }
-const db      = admin.firestore()
-const storage = new Storage({ credentials: SERVICE_ACCOUNT })
+
+const db = admin.firestore()
+
+// Lazy init du Storage (évite le crash au démarrage si env var absente)
+let _storage = null
+const getStorage = () => {
+  if (!_storage) {
+    const SERVICE_ACCOUNT = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+    _storage = new Storage({ credentials: SERVICE_ACCOUNT })
+  }
+  return _storage
+}
 
 // ── Utilitaires ──────────────────────────────────────────────────
 const timestamp = () => new Date().toISOString().replace(/[:.]/g, "-")
@@ -45,10 +59,8 @@ const serializeDoc = (data) => {
     if (value === null || value === undefined) {
       result[key] = null
     } else if (value?.toDate) {
-      // Firestore Timestamp → ISO string
       result[key] = value.toDate().toISOString()
     } else if (value?.seconds !== undefined) {
-      // Timestamp sérialisé
       result[key] = new Date(value.seconds * 1000).toISOString()
     } else if (Array.isArray(value)) {
       result[key] = value.map(v =>
@@ -78,8 +90,8 @@ const readCollection = async (colName) => {
 // ── Export JSON complet ──────────────────────────────────────────
 const exportToJson = async () => {
   log("🚀 Démarrage backup Firestore...")
-  const ts      = timestamp()
-  const backup  = {
+  const ts     = timestamp()
+  const backup = {
     meta: {
       timestamp:   new Date().toISOString(),
       collections: COLLECTIONS,
@@ -91,7 +103,7 @@ const exportToJson = async () => {
   for (const col of COLLECTIONS) {
     try {
       backup.data[col] = await readCollection(col)
-    } catch(e) {
+    } catch (e) {
       log(`  ⚠️ ${col}: ${e.message}`)
       backup.data[col] = { _error: e.message }
     }
@@ -110,8 +122,7 @@ const exportToJson = async () => {
 // ── Upload vers Cloud Storage ────────────────────────────────────
 const uploadToStorage = async (filepath, filename) => {
   log(`☁️  Upload vers gs://${BUCKET_NAME}/backups/${filename}...`)
-  const bucket = storage.bucket(BUCKET_NAME)
-
+  const bucket = getStorage().bucket(BUCKET_NAME)
   await bucket.upload(filepath, {
     destination: `backups/${filename}`,
     metadata: {
@@ -128,10 +139,10 @@ const uploadToStorage = async (filepath, filename) => {
 // ── Supprimer les vieux backups ──────────────────────────────────
 const cleanOldBackups = async () => {
   log(`🧹 Nettoyage des backups > ${RETENTION_DAYS} jours...`)
-  const bucket     = storage.bucket(BUCKET_NAME)
-  const [files]    = await bucket.getFiles({ prefix: "backups/" })
-  const cutoff     = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000
-  let   deleted    = 0
+  const bucket  = getStorage().bucket(BUCKET_NAME)
+  const [files] = await bucket.getFiles({ prefix: "backups/" })
+  const cutoff  = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000
+  let deleted   = 0
 
   for (const file of files) {
     const created = new Date(file.metadata.timeCreated).getTime()
@@ -146,7 +157,7 @@ const cleanOldBackups = async () => {
 
 // ── Lister les backups disponibles ──────────────────────────────
 const listBackups = async () => {
-  const bucket  = storage.bucket(BUCKET_NAME)
+  const bucket  = getStorage().bucket(BUCKET_NAME)
   const [files] = await bucket.getFiles({ prefix: "backups/" })
   return files
     .filter(f => f.name.endsWith(".json"))
@@ -161,11 +172,12 @@ const listBackups = async () => {
 }
 
 // ── Restore depuis un fichier JSON ───────────────────────────────
+// FIX : le bug "dead code" est corrigé — overwrite=false → ref.create()
 const restoreFromJson = async (jsonPath, options = {}) => {
   const {
-    collections = COLLECTIONS,  // collections à restaurer
-    dryRun      = true,          // true = simuler sans écrire
-    overwrite   = false,         // true = écraser les docs existants
+    collections = COLLECTIONS,
+    dryRun      = true,
+    overwrite   = false,
   } = options
 
   log(`🔄 Restore depuis: ${jsonPath}`)
@@ -191,23 +203,23 @@ const restoreFromJson = async (jsonPath, options = {}) => {
     for (const docId of ids) {
       try {
         if (!dryRun) {
-          const ref     = db.collection(colName).doc(docId)
-          const exists  = (await ref.get()).exists
+          const ref    = db.collection(colName).doc(docId)
+          const exists = (await ref.get()).exists
 
           if (exists && !overwrite) {
             stats.skipped++
             continue
           }
 
-          const mode = overwrite ? "set" : "create"
-          if (mode === "set") {
+          // FIX : overwrite=true → set (écrase), overwrite=false → create (sûr)
+          if (overwrite) {
             await ref.set(docs[docId])
           } else {
-            await ref.set(docs[docId])
+            await ref.create(docs[docId])
           }
         }
         stats.restored++
-      } catch(e) {
+      } catch (e) {
         log(`  ❌ ${colName}/${docId}: ${e.message}`)
         stats.errors++
       }
@@ -219,93 +231,74 @@ const restoreFromJson = async (jsonPath, options = {}) => {
 }
 
 // ── Endpoint Express pour intégrer dans server.js ────────────────
+// Intégration : const { backupRoutes } = require("./backup")
+//               backupRoutes(app)
+const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
+
+const verifyAdmin = async (idToken) => {
+  if (!idToken) throw Object.assign(new Error("Non authentifié"), { status: 401 })
+  const decoded = await admin.auth().verifyIdToken(idToken)
+  if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase())) {
+    throw Object.assign(new Error("Non autorisé"), { status: 403 })
+  }
+}
+
 const backupRoutes = (app) => {
   // Déclencher un backup manuel
   app.post("/api/admin/backup", async (req, res) => {
-    const { idToken } = req.body
-    if (!idToken) return res.status(401).json({ error: "Non authentifié" })
     try {
-      const decoded = await admin.auth().verifyIdToken(idToken)
-      const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
-      if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase())) {
-        return res.status(403).json({ error: "Non autorisé" })
-      }
-    } catch(e) { return res.status(401).json({ error: "Token invalide" }) }
-    try {
+      await verifyAdmin(req.body.idToken)
       const { filename, filepath } = await exportToJson()
       await uploadToStorage(filepath, filename)
       await cleanOldBackups()
       fs.unlinkSync(filepath)
       res.json({ success: true, filename })
-    } catch(e) {
-      res.status(500).json({ error: e.message })
+    } catch (e) {
+      res.status(e.status || 500).json({ error: e.message })
     }
   })
 
   // Lister les backups
   app.get("/api/admin/backups", async (req, res) => {
-    const { idToken } = req.query
-    if (!idToken) return res.status(401).json({ error: "Non authentifié" })
     try {
-      const decoded = await admin.auth().verifyIdToken(idToken)
-      const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
-      if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase())) {
-        return res.status(403).json({ error: "Non autorisé" })
-      }
-    } catch(e) { return res.status(401).json({ error: "Token invalide" }) }
-    try {
+      await verifyAdmin(req.query.idToken)
       const list = await listBackups()
       res.json({ backups: list, count: list.length })
-    } catch(e) {
-      res.status(500).json({ error: e.message })
+    } catch (e) {
+      res.status(e.status || 500).json({ error: e.message })
     }
   })
 
   // Télécharger un backup
   app.get("/api/admin/backup/:filename", async (req, res) => {
-    const { idToken } = req.query
-    if (!idToken) return res.status(401).json({ error: "Non authentifié" })
     try {
-      const decoded = await admin.auth().verifyIdToken(idToken)
-      const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
-      if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase())) {
-        return res.status(403).json({ error: "Non autorisé" })
-      }
-    } catch(e) { return res.status(401).json({ error: "Token invalide" }) }
-    try {
-      const bucket   = storage.bucket(BUCKET_NAME)
+      await verifyAdmin(req.query.idToken)
+      const bucket   = getStorage().bucket(BUCKET_NAME)
       const file     = bucket.file(`backups/${req.params.filename}`)
       const [exists] = await file.exists()
       if (!exists) return res.status(404).json({ error: "Backup introuvable" })
       res.setHeader("Content-Type", "application/json")
       res.setHeader("Content-Disposition", `attachment; filename="${req.params.filename}"`)
       file.createReadStream().pipe(res)
-    } catch(e) {
-      res.status(500).json({ error: e.message })
+    } catch (e) {
+      res.status(e.status || 500).json({ error: e.message })
     }
   })
 
   // Restore depuis un backup (dryRun par défaut)
   app.post("/api/admin/restore", async (req, res) => {
     const { idToken, filename, collections, dryRun = true, overwrite = false } = req.body
-    if (!idToken) return res.status(401).json({ error: "Non authentifié" })
     try {
-      const decoded = await admin.auth().verifyIdToken(idToken)
-      const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
-      if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase())) {
-        return res.status(403).json({ error: "Non autorisé" })
-      }
-    } catch(e) { return res.status(401).json({ error: "Token invalide" }) }
-    try {
-      const bucket    = storage.bucket(BUCKET_NAME)
+      await verifyAdmin(idToken)
+      const bucket    = getStorage().bucket(BUCKET_NAME)
       const file      = bucket.file(`backups/${filename}`)
       const localPath = `/tmp/restore_${Date.now()}.json`
       await file.download({ destination: localPath })
       const stats = await restoreFromJson(localPath, { collections, dryRun, overwrite })
       fs.unlinkSync(localPath)
       res.json({ success: true, dryRun, ...stats })
-    } catch(e) {
-      res.status(500).json({ error: e.message })
+    } catch (e) {
+      res.status(e.status || 500).json({ error: e.message })
     }
   })
 }
@@ -320,7 +313,7 @@ if (require.main === module) {
       fs.unlinkSync(filepath)
       log("🎉 Backup terminé avec succès !")
       process.exit(0)
-    } catch(e) {
+    } catch (e) {
       log(`💥 Erreur backup: ${e.message}`)
       process.exit(1)
     }
