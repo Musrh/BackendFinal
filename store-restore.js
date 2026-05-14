@@ -5,8 +5,8 @@
 // ================================================================
 
 import admin from "firebase-admin"
-const { Storage } = require("@google-cloud/storage")
-const fs    = require("fs")
+import { Storage } from "@google-cloud/storage"
+import fs from "fs"
 
 const db      = admin.firestore()
 const SERVICE_ACCOUNT = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
