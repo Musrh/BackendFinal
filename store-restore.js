@@ -4,7 +4,7 @@
 //  puis : storeRestoreRoutes(app)
 // ================================================================
 
-const admin = require("firebase-admin")
+import admin from "firebase-admin"
 const { Storage } = require("@google-cloud/storage")
 const fs    = require("fs")
 
