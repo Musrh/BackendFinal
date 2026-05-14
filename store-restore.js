@@ -1,30 +1,76 @@
 // ================================================================
-//  store-restore.js — Restore d'un store par son propriétaire
-//  Ajouter dans server.js : const { storeRestoreRoutes } = require("./store-restore")
-//  puis : storeRestoreRoutes(app)
+//  store-restore.js — Restore de données par le propriétaire du store
+//
+//  Routes exposées :
+//    GET  /api/store/backups        → liste les backups disponibles
+//    POST /api/store/restore        → restaure les données de l'utilisateur
+//
+//  Sécurité :
+//    - Chaque requête exige un idToken Firebase valide.
+//    - La restauration est strictement filtrée par uid :
+//      seules les données appartenant à l'utilisateur connecté
+//      sont touchées (ownerUid === uid ou uid === uid).
+//    - Aucun document d'un autre utilisateur n'est jamais modifié.
+//
+//  Collections restaurées pour un uid donné :
+//    users/{uid}                              (document de profil)
+//    orders   où ownerUid === uid             (commandes Pro)
+//    forders  où ownerUid === uid             (commandes Free)
+//    slugs    où uid === uid                  (slugs publiés)
+//    prodinfos où ownerUid === uid            (infos produits)
+//
+//  Variables d'env requises :
+//    FIREBASE_SERVICE_ACCOUNT   (JSON stringify du service account)
+//    BACKUP_BUCKET              (ex: "saasbuilder-backups")
+//
+//  Intégration dans server.js (ESM) — voir server-integration.txt
 // ================================================================
 
 const admin = require("firebase-admin")
-const { Storage } = require("@google-cloud/storage")
+const path  = require("path")
 const fs    = require("fs")
 
-const db      = admin.firestore()
-const SERVICE_ACCOUNT = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-const storage = new Storage({ credentials: SERVICE_ACCOUNT })
-const BUCKET  = process.env.BACKUP_BUCKET || "saasbuilder-backups"
+// ── Lazy init Firebase & Storage ────────────────────────────────
+// Ne pas appeler admin.firestore() au chargement du module.
+// Firebase est initialisé dans server.js ; on accède à l'instance
+// uniquement au moment des requêtes.
+const getDb = () => admin.firestore()
 
-// ── Vérifier le token Firebase de l'utilisateur ──────────────────
+let _storage = null
+const getStorage = () => {
+  if (!_storage) {
+    const { Storage } = require("@google-cloud/storage")
+    const creds = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+    _storage = new Storage({ credentials: creds })
+  }
+  return _storage
+}
+
+const BUCKET = process.env.BACKUP_BUCKET || "saasbuilder-backups"
+
+// ── Vérification du token Firebase ──────────────────────────────
+// Renvoie l'uid si le token est valide, sinon lève une erreur.
 const verifyToken = async (idToken) => {
+  if (!idToken) {
+    const err = new Error("Non authentifié — idToken manquant")
+    err.status = 401
+    throw err
+  }
   const decoded = await admin.auth().verifyIdToken(idToken)
   return decoded.uid
 }
 
-// ── Sérialiser pour Firestore ────────────────────────────────────
+// ── Sérialisation Firestore-safe ─────────────────────────────────
+// Convertit récursivement les types non supportés (Timestamp, etc.)
+// en types JSON primitifs. Les strings ISO restent des strings :
+// l'Admin SDK accepte les strings ISO dans set() sans problème.
 const serialize = (data) => {
   if (data === null || data === undefined) return null
   if (Array.isArray(data)) return data.map(serialize)
-  if (typeof data === "object") {
-    // Re-convertir les strings ISO en Timestamp si besoin
+  if (data && typeof data === "object") {
+    // Firestore Timestamp → string ISO
+    if (typeof data.toDate === "function") return data.toDate().toISOString()
+    if (data._seconds !== undefined) return new Date(data._seconds * 1000).toISOString()
     return Object.fromEntries(
       Object.entries(data).map(([k, v]) => [k, serialize(v)])
     )
@@ -32,130 +78,177 @@ const serialize = (data) => {
   return data
 }
 
+// ── Télécharger un backup depuis Cloud Storage ───────────────────
+const downloadBackup = async (filename) => {
+  const localPath = `/tmp/store_restore_${Date.now()}_${filename}`
+  await getStorage()
+    .bucket(BUCKET)
+    .file(`backups/${filename}`)
+    .download({ destination: localPath })
+  const raw    = fs.readFileSync(localPath, "utf-8")
+  const backup = JSON.parse(raw)
+  fs.unlinkSync(localPath)   // nettoyage immédiat
+  if (!backup.data) throw new Error("Format de backup invalide (champ 'data' manquant)")
+  return backup
+}
+
+// ── Restauration filtrée par uid ─────────────────────────────────
+// Renvoie { restored, skipped, detail } dans les deux modes.
+// En mode dryRun : aucune écriture Firestore, comptage uniquement.
+const restoreForUid = async (backup, uid, dryRun) => {
+  const db     = getDb()
+  const detail = { userData: 0, orders: 0, forders: 0, slugs: 0, prodinfos: 0 }
+  let restored = 0
+  let skipped  = 0
+
+  // 1. Profil utilisateur : users/{uid}
+  if (backup.data.users?.[uid]) {
+    if (!dryRun) {
+      await db.collection("users").doc(uid).set(
+        serialize(backup.data.users[uid]),
+        { merge: true }   // merge pour ne pas effacer des champs ajoutés après le backup
+      )
+    }
+    detail.userData = 1
+    restored++
+  } else {
+    skipped++
+  }
+
+  // 2. Commandes Pro (collection "orders"), filtrées par ownerUid
+  const ownerOrders = Object.entries(backup.data.orders || {})
+    .filter(([, d]) => d.ownerUid === uid)
+
+  for (const [docId, data] of ownerOrders) {
+    if (!dryRun) {
+      await db.collection("orders").doc(docId).set(serialize(data), { merge: true })
+    }
+    detail.orders++
+    restored++
+  }
+
+  // 3. Commandes Free (collection "forders"), filtrées par ownerUid
+  const ownerForders = Object.entries(backup.data.forders || {})
+    .filter(([, d]) => d.ownerUid === uid)
+
+  for (const [docId, data] of ownerForders) {
+    if (!dryRun) {
+      await db.collection("forders").doc(docId).set(serialize(data), { merge: true })
+    }
+    detail.forders++
+    restored++
+  }
+
+  // 4. Slugs publiés, filtrés par uid
+  const ownerSlugs = Object.entries(backup.data.slugs || {})
+    .filter(([, d]) => d.uid === uid)
+
+  for (const [docId, data] of ownerSlugs) {
+    if (!dryRun) {
+      await db.collection("slugs").doc(docId).set(serialize(data), { merge: true })
+    }
+    detail.slugs++
+    restored++
+  }
+
+  // 5. Infos produits (collection "prodinfos"), filtrées par ownerUid
+  const ownerProdinfos = Object.entries(backup.data.prodinfos || {})
+    .filter(([, d]) => d.ownerUid === uid)
+
+  for (const [docId, data] of ownerProdinfos) {
+    if (!dryRun) {
+      await db.collection("prodinfos").doc(docId).set(serialize(data), { merge: true })
+    }
+    detail.prodinfos++
+    restored++
+  }
+
+  return { restored, skipped, detail }
+}
+
+// ================================================================
+//  Routes Express
+// ================================================================
 const storeRestoreRoutes = (app) => {
 
-  // ── Lister les backups (accessible à tous les users connectés) ──
+  // ── GET /api/store/backups ──────────────────────────────────────
+  // Liste les backups disponibles (tout utilisateur connecté peut voir
+  // la liste des noms ; le contenu ne leur est pas accessible).
+  // Query param : ?idToken=<Firebase ID token>
   app.get("/api/store/backups", async (req, res) => {
     const { idToken } = req.query
-    if (!idToken) return res.status(401).json({ error: "Non authentifié" })
-
     try {
-      await verifyToken(idToken)   // vérifie que l'user est bien connecté
-      const bucket  = storage.bucket(BUCKET)
+      await verifyToken(idToken)  // authentification requise
+
+      const bucket  = getStorage().bucket(BUCKET)
       const [files] = await bucket.getFiles({ prefix: "backups/" })
 
       const backups = files
         .filter(f => f.name.endsWith(".json"))
         .map(f => ({
-          filename:  require("path").basename(f.name),
+          filename:  path.basename(f.name),
           size:      f.metadata.size,
           createdAt: f.metadata.timeCreated,
         }))
         .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-        .slice(0, 30)  // max 30 backups affichés
+        .slice(0, 30)    // max 30 backups affichés
 
       res.json({ backups, count: backups.length })
-    } catch(e) {
-      res.status(500).json({ error: e.message })
+
+    } catch (e) {
+      console.error("❌ GET /api/store/backups:", e.message)
+      res.status(e.status || 500).json({ error: e.message })
     }
   })
 
-  // ── Restore du store de l'utilisateur connecté ──────────────────
-  // Restaure UNIQUEMENT les données de cet ownerUid
-  // Ne touche pas aux données des autres utilisateurs
+  // ── POST /api/store/restore ─────────────────────────────────────
+  // Restaure les données de l'utilisateur connecté depuis un backup.
+  // Body JSON :
+  //   { idToken, filename, dryRun }
+  //     idToken  : Firebase ID token (obligatoire)
+  //     filename : nom du fichier backup, ex: "backup_2026-05-14T02-00-00.json"
+  //     dryRun   : true (simulation, défaut) | false (écriture réelle)
+  //
+  // Réponse :
+  //   { success, dryRun, uid, filename, restored, skipped, detail }
+  //   detail : { userData, orders, forders, slugs, prodinfos }
   app.post("/api/store/restore", async (req, res) => {
     const { idToken, filename, dryRun = true } = req.body
-    if (!idToken)  return res.status(401).json({ error: "Non authentifié" })
+
     if (!filename) return res.status(400).json({ error: "filename requis" })
 
+    // Sécurité : bloquer les tentatives de path traversal
+    const safeName = path.basename(filename)
+    if (safeName !== filename || !safeName.endsWith(".json")) {
+      return res.status(400).json({ error: "Nom de fichier invalide" })
+    }
+
     try {
-      // Vérifier l'identité de l'utilisateur
       const uid = await verifyToken(idToken)
-      console.log(`🔄 Restore store ${uid} depuis ${filename} (dryRun: ${dryRun})`)
 
-      // Télécharger le backup
-      const localPath = `/tmp/restore_store_${uid}_${Date.now()}.json`
-      await storage.bucket(BUCKET).file(`backups/${filename}`).download({
-        destination: localPath
-      })
+      console.log(`🔄 [store/restore] uid=${uid} | file=${safeName} | dryRun=${dryRun}`)
 
-      const raw    = fs.readFileSync(localPath, "utf-8")
-      const backup = JSON.parse(raw)
-      fs.unlinkSync(localPath)
+      const backup = await downloadBackup(safeName)
+      const stats  = await restoreForUid(backup, uid, dryRun)
 
-      if (!backup.data) throw new Error("Format de backup invalide")
-
-      const stats = { restored: 0, skipped: 0 }
-
-      // ── Restaurer uniquement les données de cet utilisateur ────
-
-      // 1. Document users/{uid}
-      if (backup.data.users?.[uid]) {
-        if (!dryRun) {
-          await db.collection("users").doc(uid).set(
-            serialize(backup.data.users[uid]),
-            { merge: true }
-          )
-        }
-        stats.restored++
-        console.log(`  ✅ users/${uid}`)
-      }
-
-      // 2. Commandes Pro (orders) de cet ownerUid
-      const ownerOrders = Object.entries(backup.data.orders || {})
-        .filter(([, data]) => data.ownerUid === uid)
-
-      for (const [docId, data] of ownerOrders) {
-        if (!dryRun) {
-          await db.collection("orders").doc(docId).set(serialize(data))
-        }
-        stats.restored++
-      }
-      console.log(`  ✅ orders: ${ownerOrders.length}`)
-
-      // 3. Commandes Free (forders) de cet ownerUid
-      const ownerForders = Object.entries(backup.data.forders || {})
-        .filter(([, data]) => data.ownerUid === uid)
-
-      for (const [docId, data] of ownerForders) {
-        if (!dryRun) {
-          await db.collection("forders").doc(docId).set(serialize(data))
-        }
-        stats.restored++
-      }
-      console.log(`  ✅ forders: ${ownerForders.length}`)
-
-      // 4. Slug de cet utilisateur
-      const ownerSlugs = Object.entries(backup.data.slugs || {})
-        .filter(([, data]) => data.uid === uid)
-
-      for (const [docId, data] of ownerSlugs) {
-        if (!dryRun) {
-          await db.collection("slugs").doc(docId).set(serialize(data))
-        }
-        stats.restored++
-      }
-      console.log(`  ✅ slugs: ${ownerSlugs.length}`)
-
-      console.log(`✅ Restore store ${uid}: ${stats.restored} éléments (dryRun: ${dryRun})`)
+      console.log(
+        `✅ [store/restore] uid=${uid} | restored=${stats.restored}` +
+        ` | skipped=${stats.skipped} | dryRun=${dryRun}`
+      )
 
       res.json({
         success:  true,
         dryRun,
         uid,
-        filename,
-        ...stats,
-        detail: {
-          userData:  backup.data.users?.[uid] ? 1 : 0,
-          orders:    ownerOrders.length,
-          forders:   ownerForders.length,
-          slugs:     ownerSlugs.length,
-        }
+        filename: safeName,
+        restored: stats.restored,
+        skipped:  stats.skipped,
+        detail:   stats.detail,
       })
 
-    } catch(e) {
-      console.error("❌ store/restore:", e.message)
-      res.status(500).json({ error: e.message })
+    } catch (e) {
+      console.error(`❌ [store/restore] ${e.message}`)
+      res.status(e.status || 500).json({ error: e.message })
     }
   })
 
