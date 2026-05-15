@@ -1,6 +1,6 @@
 // ===============================================================
 //  server.js — Backend COMPLET SaasBuilder + SaasBuilder
-//  Version fusionnée finale
+//  Version fusionnée finale + Backup & Restore
 //
 //  SaasBuilder (abonnements) :
 //    POST /create-billing-session   → abonnement propriétaire
@@ -18,11 +18,21 @@
 //    GET  /api/orders/:storeUid     → commandes
 //    GET  /api/debug/:storeUid      → diagnostic produits
 //
+//  Backup & Restore (NOUVEAU) :
+//    POST /api/admin/backup         → backup manuel (admin)
+//    GET  /api/admin/backups        → liste des backups (admin)
+//    GET  /api/admin/backup/:file   → télécharger un backup (admin)
+//    POST /api/admin/restore        → restaurer toutes collections (admin)
+//    GET  /api/store/backups        → liste des backups (user connecté)
+//    POST /api/store/restore        → restaurer SES données uniquement
+//
 //  Variables d'env requises :
 //    STRIPE_SECRET_KEY
 //    STRIPE_WEBHOOK_SECRET
 //    FIREBASE_SERVICE_ACCOUNT     (JSON stringify)
 //    VITE_GROQ_API_KEY            (ou GROQ_API_KEY)
+//    BACKUP_BUCKET                (ex: "saasbuilder-backups")  ← NOUVEAU
+//    BACKUP_RETENTION_DAYS        (défaut: 30)                 ← NOUVEAU
 // ===============================================================
 
 import express    from "express"
@@ -32,6 +42,17 @@ import dotenv     from "dotenv"
 import admin      from "firebase-admin"
 import bodyParser from "body-parser"
 import Groq       from "groq-sdk"
+import cron       from "node-cron"
+
+// ── Pont ESM → CommonJS pour backup.js et store-restore.js ───
+// backup.js et store-restore.js utilisent require() (CommonJS).
+// createRequire permet de les charger depuis un module ESM.
+import { createRequire } from "module"
+const require = createRequire(import.meta.url)
+
+const { backupRoutes }       = require("./backup.js")
+const { storeRestoreRoutes } = require("./store-restore.js")
+const { exportStoreRoutes }  = require("./export-store.js")
 
 dotenv.config()
 
@@ -793,7 +814,7 @@ app.post("/create-billing-session", async (req, res) => {
     const { email, plan, ownerUid } = req.body
     if (!ownerUid) return res.status(400).json({ error: "ownerUid requis" })
 
-    const prices = { basic: 500, pro: 1500, premium: 2900 }
+    const prices = { basic: 0, pro: 1000 }
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -802,7 +823,7 @@ app.post("/create-billing-session", async (req, res) => {
         price_data: {
           currency: "eur",
           product_data: { name: `Abonnement ${plan || "pro"}` },
-          unit_amount: prices[plan] || 1500,
+          unit_amount: prices[plan] || 1000,
         },
         quantity: 1,
       }],
@@ -896,55 +917,153 @@ app.post("/force-upgrade", async (req, res) => {
 // ===============================================================
 app.post("/create-connect-account", async (req, res) => {
   try {
-    const { ownerUid, email, country } = req.body   // ← country lu depuis le Dashboard
-
+    const { ownerUid, email } = req.body
     const userRef = db.collection("users").doc(ownerUid)
     const userDoc = await userRef.get()
     let accountId = userDoc.exists && userDoc.data().stripeAccountId
       ? userDoc.data().stripeAccountId
       : null
 
-    // Si un compte Stripe Connect existe déjà, vérifier si le pays correspond.
-    // Stripe ne permet pas de changer le pays d'un compte existant → on en crée un nouveau.
-    if (accountId && country) {
-      try {
-        const existing = await stripe.accounts.retrieve(accountId)
-        if (existing.country && existing.country.toUpperCase() !== country.toUpperCase()) {
-          console.log(`🔄 Pays différent (existant: ${existing.country}, demandé: ${country}) → nouveau compte Stripe Connect`)
-          accountId = null  // forcer la création d'un nouveau compte
-        }
-      } catch (e) {
-        console.warn("⚠️ Récupération compte Stripe échouée (sera recréé):", e.message)
-        accountId = null
-      }
+    if (!accountId) {
+      const account = await stripe.accounts.create({ type: "express", email })
+      accountId = account.id
     }
 
-    if (!accountId) {
-      const account = await stripe.accounts.create({
-        type:    "express",
-        email,
-        country: (country || "FR").toUpperCase(),   // ← pays choisi par l'utilisateur
-        capabilities: {
-          card_payments: { requested: true },
-          transfers:     { requested: true },
-        },
-      })
-      accountId = account.id
-      await userRef.set({ stripeAccountId: accountId }, { merge: true })
-      console.log(`✅ Compte Stripe Connect créé: ${accountId} | pays: ${country || "FR"}`)
-    }
+    // Toujours marquer stripeVerified: false quand le propriétaire (re)configure
+    // L'admin SaaS devra vérifier dans Stripe et activer manuellement
+    await userRef.set({
+      stripeAccountId: accountId,
+      stripeVerified:  false,          // ← en attente de vérification admin
+      stripeSubmittedAt: Date.now(),   // ← date de soumission
+    }, { merge: true })
 
     const link = await stripe.accountLinks.create({
       account:     accountId,
       refresh_url: `${FRONTEND_BUILDER}/#/reauth`,
-      return_url:  `${FRONTEND_BUILDER}/#/dashboard`,
+      return_url:  `${FRONTEND_BUILDER}/#/dashboard?stripe=pending`,
       type:        "account_onboarding",
     })
 
+    console.log(`🔗 Stripe Connect soumis: ${ownerUid} | account: ${accountId}`)
     res.json({ url: link.url })
   } catch (err) {
     console.error("❌ create-connect-account:", err.message)
     res.status(500).json({ error: err.message })
+  }
+})
+
+
+// ===============================================================
+//  POST /api/admin/verify-stripe — Vérifier et activer Stripe d'un propriétaire
+//  Appelé par l'admin SaaS après vérification dans le dashboard Stripe
+// ===============================================================
+app.post("/api/admin/verify-stripe", async (req, res) => {
+  const { idToken, ownerUid, approve } = req.body
+  if (!idToken) return res.status(401).json({ error: "Non authentifié" })
+
+  try {
+    // Vérifier que c'est bien un admin SaaS
+    const decoded      = await admin.auth().verifyIdToken(idToken)
+    const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
+    if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase())) {
+      return res.status(403).json({ error: "Non autorisé" })
+    }
+
+    if (!ownerUid) return res.status(400).json({ error: "ownerUid requis" })
+
+    const userRef  = db.collection("users").doc(ownerUid)
+    const userSnap = await userRef.get()
+    if (!userSnap.exists) return res.status(404).json({ error: "Utilisateur introuvable" })
+
+    const userData   = userSnap.data()
+    const accountId  = userData.stripeAccountId
+
+    if (!accountId) {
+      return res.status(400).json({ error: "Aucun compte Stripe Connect trouvé" })
+    }
+
+    if (approve) {
+      // Vérifier l'état réel du compte dans Stripe
+      const account = await stripe.accounts.retrieve(accountId)
+      const chargesEnabled  = account.charges_enabled
+      const payoutsEnabled  = account.payouts_enabled
+      const detailsSubmitted = account.details_submitted
+
+      // Activer seulement si Stripe confirme que le compte est opérationnel
+      await userRef.set({
+        stripeVerified:    true,
+        stripeActivatedAt: Date.now(),
+        stripeChargesEnabled:  chargesEnabled,
+        stripePayoutsEnabled:  payoutsEnabled,
+        stripeDetailsSubmitted: detailsSubmitted,
+      }, { merge: true })
+
+      console.log(`✅ Stripe activé pour ${ownerUid} | charges: ${chargesEnabled} | payouts: ${payoutsEnabled}`)
+      res.json({
+        success: true,
+        ownerUid,
+        accountId,
+        chargesEnabled,
+        payoutsEnabled,
+        detailsSubmitted,
+        message: `Stripe activé pour ${userData.email || ownerUid}`
+      })
+    } else {
+      // Rejeter / désactiver
+      await userRef.set({
+        stripeVerified:   false,
+        stripeRejectedAt: Date.now(),
+      }, { merge: true })
+
+      console.log(`🚫 Stripe rejeté pour ${ownerUid}`)
+      res.json({ success: true, ownerUid, message: "Stripe rejeté" })
+    }
+
+  } catch(e) {
+    console.error("❌ verify-stripe:", e.message)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+
+// ===============================================================
+//  GET /api/admin/stripe-accounts — Lister les comptes en attente
+// ===============================================================
+app.get("/api/admin/stripe-accounts", async (req, res) => {
+  const { idToken } = req.query
+  if (!idToken) return res.status(401).json({ error: "Non authentifié" })
+
+  try {
+    const decoded      = await admin.auth().verifyIdToken(idToken)
+    const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
+    if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase())) {
+      return res.status(403).json({ error: "Non autorisé" })
+    }
+
+    // Récupérer tous les users avec un compte Stripe soumis
+    const snap = await db.collection("users")
+      .where("stripeAccountId", "!=", null)
+      .get()
+
+    const accounts = snap.docs.map(d => {
+      const data = d.data()
+      return {
+        uid:              d.id,
+        email:            data.email,
+        plan:             data.plan,
+        stripeAccountId:  data.stripeAccountId,
+        stripeVerified:   data.stripeVerified || false,
+        stripeSubmittedAt: data.stripeSubmittedAt,
+        stripeActivatedAt: data.stripeActivatedAt,
+      }
+    })
+
+    const pending = accounts.filter(a => !a.stripeVerified)
+    const active  = accounts.filter(a =>  a.stripeVerified)
+
+    res.json({ pending, active, total: accounts.length })
+  } catch(e) {
+    res.status(500).json({ error: e.message })
   }
 })
 
@@ -959,6 +1078,7 @@ app.get("/", (req, res) => {
     groq:     process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY ? "✅ configuré" : "❌ clé manquante",
     firebase: serviceAccount ? "✅ configuré" : "❌ non configuré",
     stripe:   process.env.STRIPE_SECRET_KEY ? "✅ configuré" : "❌ clé manquante",
+    backup:   process.env.BACKUP_BUCKET ? `✅ bucket: ${process.env.BACKUP_BUCKET}` : "❌ BACKUP_BUCKET manquant",
     endpoints: [
       "POST /create-billing-session",
       "POST /create-stripe-session",
@@ -971,10 +1091,125 @@ app.get("/", (req, res) => {
       "GET  /api/orders/:storeUid",
       "GET  /api/forders/:storeUid",
       "GET  /api/debug/:storeUid",
+      "POST /api/admin/check-expiry",
+      "POST /api/admin/backup",
+      "GET  /api/admin/backups",
+      "GET  /api/admin/backup/:filename",
+      "POST /api/admin/restore",
+      "GET  /api/store/backups",
+      "POST /api/store/restore",
     ]
   })
 })
 
+
+// ===============================================================
+//  Backup & Restore — Routes (depuis backup.js et store-restore.js)
+// ===============================================================
+backupRoutes(app)        // Admin : /api/admin/backup, /api/admin/backups, /api/admin/restore
+storeRestoreRoutes(app)  // Store  : /api/store/backups, /api/store/restore
+exportStoreRoutes(app)   // Admin  : /api/admin/export-store/:uid, /api/admin/export-all
+
+
+// ===============================================================
+//  CRON — Vérification des comptes expirés
+//  Tourne tous les jours à 1h00 du matin
+//  Désactive les comptes dont expiry < Date.now()
+// ===============================================================
+const checkExpiredAccounts = async () => {
+  console.log("[CRON] 🔍 Vérification des comptes expirés...")
+  const now      = Date.now()
+  let   disabled = 0
+  let   checked  = 0
+
+  try {
+    // Récupérer tous les users actifs avec une date d'expiration dépassée
+    const snap = await db.collection("users")
+      .where("active", "==", true)
+      .where("expiry", "<", now)
+      .get()
+
+    checked = snap.size
+    console.log(`[CRON] 📊 ${checked} compte(s) avec expiry dépassé`)
+
+    for (const doc of snap.docs) {
+      const data = doc.data()
+
+      // Ne pas désactiver les admins
+      if (["musmamon@gmail.com", "musrh@gmail.com"].includes(data.email?.toLowerCase())) {
+        console.log(`[CRON] ⚙️  Admin ignoré: ${data.email}`)
+        continue
+      }
+
+      // Ne pas désactiver les plans gratuits (pas d'expiry pour eux)
+      if (data.plan === "free" || !data.expiry) {
+        continue
+      }
+
+      try {
+        await doc.ref.set({
+          active:             false,
+          subscriptionActive: false,
+          paye:               false,
+          suspendedAt:        now,
+          suspendedReason:    "expiry",
+        }, { merge: true })
+
+        console.log(`[CRON] 🔒 Compte désactivé: ${data.email} | expiry: ${new Date(data.expiry).toISOString()}`)
+        disabled++
+      } catch(e) {
+        console.error(`[CRON] ❌ Erreur désactivation ${doc.id}:`, e.message)
+      }
+    }
+
+    console.log(`[CRON] ✅ Terminé — ${disabled}/${checked} compte(s) désactivé(s)`)
+  } catch(e) {
+    console.error("[CRON] ❌ Erreur checkExpiredAccounts:", e.message)
+  }
+
+  return { checked, disabled }
+}
+
+// Lancer le cron tous les jours à 1h00
+cron.schedule("0 1 * * *", () => {
+  console.log("[CRON] ⏰ Déclenchement quotidien checkExpiredAccounts")
+  checkExpiredAccounts()
+})
+
+// ===============================================================
+//  CRON — Backup Firestore automatique à 2h00 UTC
+// ===============================================================
+cron.schedule("0 2 * * *", async () => {
+  console.log("[CRON] ☁️  Démarrage backup automatique Firestore...")
+  try {
+    const { exportToJson, uploadToStorage, cleanOldBackups } = require("./backup.js")
+    const fs = require("fs")
+    const { filename, filepath } = await exportToJson()
+    await uploadToStorage(filepath, filename)
+    await cleanOldBackups()
+    fs.unlinkSync(filepath)
+    console.log(`[CRON] ✅ Backup OK : ${filename}`)
+  } catch (e) {
+    console.error("[CRON] ❌ Backup échoué :", e.message)
+  }
+})
+
+// Endpoint manuel pour déclencher la vérification (debug/admin)
+app.post("/api/admin/check-expiry", async (req, res) => {
+  const { idToken } = req.body
+  if (!idToken) return res.status(401).json({ error: "Non authentifié" })
+  try {
+    const decoded      = await admin.auth().verifyIdToken(idToken)
+    const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
+    if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase())) {
+      return res.status(403).json({ error: "Non autorisé" })
+    }
+    const result = await checkExpiredAccounts()
+    res.json({ success: true, ...result })
+  } catch(e) {
+    res.status(500).json({ error: e.message })
+  }
+})
 
 // ===============================================================
 //  START
@@ -984,4 +1219,6 @@ app.listen(PORT, () => {
   console.log(`🤖 Groq:     ${process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY ? "✅" : "❌ VITE_GROQ_API_KEY manquant"}`)
   console.log(`🔥 Firebase: ${serviceAccount ? "✅" : "❌ FIREBASE_SERVICE_ACCOUNT manquant"}`)
   console.log(`💳 Stripe:   ${process.env.STRIPE_SECRET_KEY ? "✅" : "❌ STRIPE_SECRET_KEY manquant"}`)
+  console.log(`☁️  Backup:   ${process.env.BACKUP_BUCKET ? `✅ bucket: ${process.env.BACKUP_BUCKET}` : "❌ BACKUP_BUCKET manquant"}`)
+  console.log(`⏰ Cron:     Expiry 01h00 | Backup 02h00 UTC`)
 })
