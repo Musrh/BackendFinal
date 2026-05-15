@@ -4,9 +4,9 @@
 //  puis : storeRestoreRoutes(app)
 // ================================================================
 
-import admin from "firebase-admin"
-import { Storage } from "@google-cloud/storage"
-import fs from "fs"
+const admin = require("firebase-admin")
+const { Storage } = require("@google-cloud/storage")
+const fs    = require("fs")
 
 const db      = admin.firestore()
 const SERVICE_ACCOUNT = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
@@ -36,7 +36,7 @@ const storeRestoreRoutes = (app) => {
 
   // ── Lister les backups (accessible à tous les users connectés) ──
   app.get("/api/store/backups", async (req, res) => {
-    const { idToken } = req.query
+    const idToken = req.headers.authorization?.replace("Bearer ", "") || req.query.idToken
     if (!idToken) return res.status(401).json({ error: "Non authentifié" })
 
     try {
@@ -64,7 +64,8 @@ const storeRestoreRoutes = (app) => {
   // Restaure UNIQUEMENT les données de cet ownerUid
   // Ne touche pas aux données des autres utilisateurs
   app.post("/api/store/restore", async (req, res) => {
-    const { idToken, filename, dryRun = true } = req.body
+    const idToken = req.headers.authorization?.replace("Bearer ", "") || req.body.idToken
+    const { filename, dryRun = true } = req.body
     if (!idToken)  return res.status(401).json({ error: "Non authentifié" })
     if (!filename) return res.status(400).json({ error: "filename requis" })
 
@@ -92,9 +93,9 @@ const storeRestoreRoutes = (app) => {
       // 1. Document users/{uid}
       if (backup.data.users?.[uid]) {
         if (!dryRun) {
+          // merge: false = restauration complète (écrase les champs absents du backup)
           await db.collection("users").doc(uid).set(
-            serialize(backup.data.users[uid]),
-            { merge: true }
+            serialize(backup.data.users[uid])
           )
         }
         stats.restored++
@@ -137,6 +138,18 @@ const storeRestoreRoutes = (app) => {
       }
       console.log(`  ✅ slugs: ${ownerSlugs.length}`)
 
+      // 5. Infos produits (prodinfos) de cet ownerUid
+      const ownerProdinfos = Object.entries(backup.data.prodinfos || {})
+        .filter(([, data]) => data.ownerUid === uid)
+
+      for (const [docId, data] of ownerProdinfos) {
+        if (!dryRun) {
+          await db.collection("prodinfos").doc(docId).set(serialize(data))
+        }
+        stats.restored++
+      }
+      console.log(`  ✅ prodinfos: ${ownerProdinfos.length}`)
+
       console.log(`✅ Restore store ${uid}: ${stats.restored} éléments (dryRun: ${dryRun})`)
 
       res.json({
@@ -150,6 +163,7 @@ const storeRestoreRoutes = (app) => {
           orders:    ownerOrders.length,
           forders:   ownerForders.length,
           slugs:     ownerSlugs.length,
+          prodinfos: ownerProdinfos.length,
         }
       })
 
@@ -161,4 +175,4 @@ const storeRestoreRoutes = (app) => {
 
 }
 
-export { storeRestoreRoutes }
+module.exports = { storeRestoreRoutes }
