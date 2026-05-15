@@ -39,15 +39,15 @@ import express    from "express"
 import cors       from "cors"
 import Stripe     from "stripe"
 import dotenv     from "dotenv"
-import admin      from "firebase-admin"
 import bodyParser from "body-parser"
 import Groq       from "groq-sdk"
 import cron       from "node-cron"
 
-// ── Pont ESM → CommonJS pour backup.js et store-restore.js ───
-// backup.js et store-restore.js utilisent require() (CommonJS).
-import { backupRoutes, exportToJson, uploadToStorage, cleanOldBackups } from "./backup.js"
+// ── Firebase Admin (singleton partagé) ───────────────────────
+import admin, { db } from "./firebase-admin.js"
 
+// ── Backup & Restore ──────────────────────────────────────────
+import { backupRoutes, exportToJson, uploadToStorage, cleanOldBackups } from "./backup.js"
 import { storeRestoreRoutes } from "./store-restore.js"
 import { exportStoreRoutes }  from "./export-store.js"
 
@@ -57,22 +57,6 @@ const app  = express()
 const PORT = process.env.PORT || 8080
 
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }))
-
-// ── Firebase Admin ────────────────────────────────────────────
-let serviceAccount = null
-try {
-  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-} catch (e) {
-  console.error("❌ Firebase service account JSON invalide:", e.message)
-}
-
-if (serviceAccount && !admin.apps.length) {
-  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) })
-} else {
-  console.error("❌ Firebase NON initialisé — vérifier FIREBASE_SERVICE_ACCOUNT")
-}
-
-const db = admin.firestore()
 
 // ── Stripe ────────────────────────────────────────────────────
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
@@ -1029,7 +1013,7 @@ app.get("/", (req, res) => {
     status:   "OK",
     service:  "SaasBuilder + SaasBuilder Backend",
     groq:     process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY ? "✅ configuré" : "❌ clé manquante",
-    firebase: serviceAccount ? "✅ configuré" : "❌ non configuré",
+    firebase: admin.apps.length ? "✅ configuré" : "❌ non configuré",
     stripe:   process.env.STRIPE_SECRET_KEY ? "✅ configuré" : "❌ clé manquante",
     backup:   process.env.BACKUP_BUCKET ? `✅ bucket: ${process.env.BACKUP_BUCKET}` : "❌ BACKUP_BUCKET manquant",
     endpoints: [
@@ -1164,7 +1148,7 @@ app.post("/api/admin/check-expiry", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on port ${PORT}`)
   console.log(`🤖 Groq:     ${process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY ? "✅" : "❌ VITE_GROQ_API_KEY manquant"}`)
-  console.log(`🔥 Firebase: ${serviceAccount ? "✅" : "❌ FIREBASE_SERVICE_ACCOUNT manquant"}`)
+  console.log(`🔥 Firebase: ${admin.apps.length ? "✅" : "❌ FIREBASE_SERVICE_ACCOUNT manquant"}`)
   console.log(`💳 Stripe:   ${process.env.STRIPE_SECRET_KEY ? "✅" : "❌ STRIPE_SECRET_KEY manquant"}`)
   console.log(`☁️  Backup:   ${process.env.BACKUP_BUCKET ? `✅ bucket: ${process.env.BACKUP_BUCKET}` : "❌ BACKUP_BUCKET manquant"}`)
   console.log(`⏰ Cron:     Expiry 01h00 | Backup 02h00 UTC`)
