@@ -66,7 +66,7 @@ try {
   console.error("❌ Firebase service account JSON invalide:", e.message)
 }
 
-if (serviceAccount) {
+if (serviceAccount && !admin.apps.length) {
   admin.initializeApp({ credential: admin.credential.cert(serviceAccount) })
 } else {
   console.error("❌ Firebase NON initialisé — vérifier FIREBASE_SERVICE_ACCOUNT")
