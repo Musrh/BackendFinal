@@ -46,13 +46,10 @@ import cron       from "node-cron"
 
 // ── Pont ESM → CommonJS pour backup.js et store-restore.js ───
 // backup.js et store-restore.js utilisent require() (CommonJS).
-// createRequire permet de les charger depuis un module ESM.
-import { createRequire } from "module"
-const require = createRequire(import.meta.url)
+import { backupRoutes, exportToJson, uploadToStorage, cleanOldBackups } from "./backup.js"
 
-const { backupRoutes }       = require("./backup.js")
-const { storeRestoreRoutes } = require("./store-restore.js")
-const { exportStoreRoutes }  = require("./export-store.js")
+import { storeRestoreRoutes } from "./store-restore.js"
+import { exportStoreRoutes }  from "./export-store.js"
 
 dotenv.config()
 
@@ -89,8 +86,6 @@ const groq = new Groq({
 const FRONTEND           = "https://musrh.github.io/SaasBuilder"
 const FRONTEND_BUILDER   = FRONTEND   // SaasBuilder (abonnements)
 const FRONTEND_GENERATOR = FRONTEND   // SaasBuilder (stores clients)
-
-
 // ===============================================================
 //  ⚠️  WEBHOOK STRIPE — DOIT ÊTRE AVANT express.json()
 // ===============================================================
@@ -276,8 +271,6 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
           // ── Collection racine : orders (Pro) ou forders (Free) ──
           await db.collection(rootCollection).doc(session.id).set(orderData)
           console.log(`🛒 COMMANDE STORE [${rootCollection}] OK:`, session.id, "| plan:", metadata.plan)
-
-
         } catch (e) { console.error("❌ commande store:", e.message) }
       }
     }
@@ -285,12 +278,8 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
 
   res.json({ received: true })
 })
-
-
 // ── JSON middleware (après webhook) ───────────────────────────
 app.use(express.json())
-
-
 // ===============================================================
 //  UTILITAIRES FIRESTORE
 // ===============================================================
@@ -383,8 +372,6 @@ const getProduits = async (storeUid) => {
     return []
   }
 }
-
-
 // Charger les commandes (cmdinfos + orders)
 const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
   try {
@@ -452,8 +439,6 @@ const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
     return []
   }
 }
-
-
 // Sauvegarder une requête non résolue
 const saveRequete = async (storeUid, data) => {
   try {
@@ -473,8 +458,6 @@ const saveRequete = async (storeUid, data) => {
     return null
   }
 }
-
-
 // Construire le contexte produits pour le prompt Groq
 const buildProduitsContext = (produits) => {
   if (!produits.length) return "Aucun produit disponible dans le catalogue."
@@ -489,8 +472,6 @@ const buildProduitsContext = (produits) => {
     return `- ${p.name || p.nom} ${badge} | Prix: ${priceFmt}${desc ? " | " + desc : ""}${stock}`
   }).join("\n")
 }
-
-
 // Construire le contexte commandes pour le prompt Groq
 const buildCmdContext = (cmds) => {
   if (!cmds.length) return "Aucune commande trouvée."
@@ -509,8 +490,6 @@ const buildCmdContext = (cmds) => {
     return `Commande #${(c.id||"").slice(0,8).toUpperCase()} | Date: ${date} | Articles: ${items || "N/A"} | Total: ${c.total || c.montant || "N/A"}€ | Statut: ${statut} | Livraison: ${c.customerAddress || c.adresseLivraison || "non renseignée"}`
   }).join("\n")
 }
-
-
 // ===============================================================
 //  POST /api/assistant — Chat Groq + contexte Firestore
 // ===============================================================
@@ -621,8 +600,6 @@ ${cmdsCtx || "Aucune commande chargée. Si le client demande sa commande, invite
     res.status(500).json({ error: "Erreur assistant: " + e.message })
   }
 })
-
-
 // ===============================================================
 //  POST /api/save-request — Sauvegarder requête non résolue
 // ===============================================================
@@ -635,8 +612,6 @@ app.post("/api/save-request", async (req, res) => {
     res.status(500).json({ error: e.message })
   }
 })
-
-
 // ===============================================================
 //  GET /api/debug/:storeUid — Diagnostic assistant
 // ===============================================================
@@ -652,8 +627,6 @@ app.get("/api/debug/:storeUid", async (req, res) => {
     })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
-
-
 // ===============================================================
 //  GET /api/products/:storeUid
 // ===============================================================
@@ -661,8 +634,6 @@ app.get("/api/products/:storeUid", async (req, res) => {
   const produits = await getProduits(req.params.storeUid)
   res.json({ produits, count: produits.length })
 })
-
-
 // ===============================================================
 //  GET /api/orders/:storeUid  — Commandes Pro (collection orders)
 // ===============================================================
@@ -680,8 +651,6 @@ app.get("/api/orders/:storeUid", async (req, res) => {
     res.json({ commandes: cmds, count: cmds.length })
   }
 })
-
-
 // ===============================================================
 //  GET /api/forders/:storeUid  — Commandes Free (collection forders)
 // ===============================================================
@@ -701,8 +670,6 @@ app.get("/api/forders/:storeUid", async (req, res) => {
     res.status(500).json({ error: e.message })
   }
 })
-
-
 // ===============================================================
 //  POST /create-stripe-session — Paiement client du store
 // ===============================================================
@@ -792,8 +759,6 @@ app.post("/create-store-session", async (req, res) => {
     res.status(500).json({ error: err.message, details: err.message })
   }
 })
-
-
 // ===============================================================
 //  POST /create-stripe-session — Alias de create-store-session
 //  (SiteViewer appelle cfg.backendUrl qui pointe vers cette route)
@@ -804,8 +769,6 @@ app.post("/create-stripe-session", async (req, res, next) => {
   // Re-router vers create-store-session
   app._router.handle(req, res, next)
 })
-
-
 // ===============================================================
 //  POST /create-billing-session — Abonnement SaasBuilder
 // ===============================================================
@@ -853,8 +816,6 @@ app.post("/create-billing-session", async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
-
-
 // ===============================================================
 //  POST /force-upgrade — Debug : forcer upgrade plan (test)
 // ===============================================================
@@ -910,8 +871,6 @@ app.post("/force-upgrade", async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
-
-
 // ===============================================================
 //  POST /create-connect-account — Stripe Connect
 // ===============================================================
@@ -951,8 +910,6 @@ app.post("/create-connect-account", async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
-
-
 // ===============================================================
 //  POST /api/admin/verify-stripe — Vérifier et activer Stripe d'un propriétaire
 //  Appelé par l'admin SaaS après vérification dans le dashboard Stripe
@@ -1024,8 +981,6 @@ app.post("/api/admin/verify-stripe", async (req, res) => {
     res.status(500).json({ error: e.message })
   }
 })
-
-
 // ===============================================================
 //  GET /api/admin/stripe-accounts — Lister les comptes en attente
 // ===============================================================
@@ -1066,8 +1021,6 @@ app.get("/api/admin/stripe-accounts", async (req, res) => {
     res.status(500).json({ error: e.message })
   }
 })
-
-
 // ===============================================================
 //  GET / — Health check
 // ===============================================================
@@ -1101,16 +1054,12 @@ app.get("/", (req, res) => {
     ]
   })
 })
-
-
 // ===============================================================
 //  Backup & Restore — Routes (depuis backup.js et store-restore.js)
 // ===============================================================
 backupRoutes(app)        // Admin : /api/admin/backup, /api/admin/backups, /api/admin/restore
 storeRestoreRoutes(app)  // Store  : /api/store/backups, /api/store/restore
 exportStoreRoutes(app)   // Admin  : /api/admin/export-store/:uid, /api/admin/export-all
-
-
 // ===============================================================
 //  CRON — Vérification des comptes expirés
 //  Tourne tous les jours à 1h00 du matin
@@ -1182,8 +1131,6 @@ cron.schedule("0 1 * * *", () => {
 cron.schedule("0 2 * * *", async () => {
   console.log("[CRON] ☁️  Démarrage backup automatique Firestore...")
   try {
-    const { exportToJson, uploadToStorage, cleanOldBackups } = require("./backup.js")
-    const fs = require("fs")
     const { filename, filepath } = await exportToJson()
     await uploadToStorage(filepath, filename)
     await cleanOldBackups()
