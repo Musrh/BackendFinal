@@ -7,8 +7,8 @@ import { Storage }   from "@google-cloud/storage"
 import fs            from "fs"
 import path          from "path"
 
-const db      = admin.firestore()
 const SERVICE_ACCOUNT = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+const db      = admin.firestore()
 const storage = new Storage({ credentials: SERVICE_ACCOUNT })
 const BUCKET  = process.env.BACKUP_BUCKET || "saasbuilder-backups"
 
