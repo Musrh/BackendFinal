@@ -1,53 +1,34 @@
 // ================================================================
 //  backup.js — Sauvegarde Firestore → Cloud Storage  (ESM)
 //  Usage : node backup.js
-//  Cron  : 0 2 * * * node /app/backup.js   (tous les jours à 2h)
+//  Cron  : 0 2 * * * node /app/backup.js
 // ================================================================
 
-import admin             from "firebase-admin"
 import { Storage }       from "@google-cloud/storage"
 import fs                from "fs"
 import path              from "path"
 import { fileURLToPath } from "url"
+import admin, { db, SERVICE_ACCOUNT } from "./firebase-admin.js"
 
 const __filename = fileURLToPath(import.meta.url)
 
-// ── Config ──────────────────────────────────────────────────────
-const SERVICE_ACCOUNT = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-const BUCKET_NAME     = process.env.BACKUP_BUCKET || "saasbuilder-backups"
-const RETENTION_DAYS  = parseInt(process.env.BACKUP_RETENTION_DAYS || "30")
+const BUCKET_NAME    = process.env.BACKUP_BUCKET || "saasbuilder-backups"
+const RETENTION_DAYS = parseInt(process.env.BACKUP_RETENTION_DAYS || "30")
+const COLLECTIONS    = ["users","orders","forders","slugs","subscriptions","customers","prodinfos"]
+const storage        = new Storage({ credentials: SERVICE_ACCOUNT })
 
-const COLLECTIONS = [
-  "users", "orders", "forders", "slugs",
-  "subscriptions", "customers", "prodinfos",
-]
-
-// ── Init Firebase Admin ──────────────────────────────────────────
-const db      = admin.firestore()
-const storage = new Storage({ credentials: SERVICE_ACCOUNT })
-
-// ── Utilitaires ──────────────────────────────────────────────────
 const timestamp = () => new Date().toISOString().replace(/[:.]/g, "-")
 const log       = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`)
 
 const serializeDoc = (data) => {
   const result = {}
   for (const [key, value] of Object.entries(data)) {
-    if (value === null || value === undefined) {
-      result[key] = null
-    } else if (value?.toDate) {
-      result[key] = value.toDate().toISOString()
-    } else if (value?.seconds !== undefined) {
-      result[key] = new Date(value.seconds * 1000).toISOString()
-    } else if (Array.isArray(value)) {
-      result[key] = value.map(v =>
-        typeof v === "object" && v !== null ? serializeDoc(v) : v
-      )
-    } else if (typeof value === "object") {
-      result[key] = serializeDoc(value)
-    } else {
-      result[key] = value
-    }
+    if (value === null || value === undefined)   result[key] = null
+    else if (value?.toDate)                      result[key] = value.toDate().toISOString()
+    else if (value?.seconds !== undefined)       result[key] = new Date(value.seconds * 1000).toISOString()
+    else if (Array.isArray(value))               result[key] = value.map(v => typeof v === "object" && v !== null ? serializeDoc(v) : v)
+    else if (typeof value === "object")          result[key] = serializeDoc(value)
+    else                                         result[key] = value
   }
   return result
 }
@@ -61,26 +42,21 @@ const readCollection = async (colName) => {
   return docs
 }
 
-// ── Export JSON complet ──────────────────────────────────────────
 export const exportToJson = async () => {
   log("🚀 Démarrage backup Firestore...")
   const ts     = timestamp()
   const backup = { meta: { timestamp: new Date().toISOString(), collections: COLLECTIONS, version: "1.0" }, data: {} }
-
   for (const col of COLLECTIONS) {
     try      { backup.data[col] = await readCollection(col) }
     catch(e) { log(`  ⚠️ ${col}: ${e.message}`); backup.data[col] = { _error: e.message } }
   }
-
   const filename = `backup_${ts}.json`
   const filepath = path.join("/tmp", filename)
   fs.writeFileSync(filepath, JSON.stringify(backup, null, 2))
-  const sizeKb = (fs.statSync(filepath).size / 1024).toFixed(1)
-  log(`📄 Fichier créé: ${filename} (${sizeKb} KB)`)
+  log(`📄 Fichier créé: ${filename} (${(fs.statSync(filepath).size/1024).toFixed(1)} KB)`)
   return { filename, filepath, ts, backup }
 }
 
-// ── Upload vers Cloud Storage ────────────────────────────────────
 export const uploadToStorage = async (filepath, filename) => {
   log(`☁️  Upload vers gs://${BUCKET_NAME}/backups/${filename}...`)
   await storage.bucket(BUCKET_NAME).upload(filepath, {
@@ -90,7 +66,6 @@ export const uploadToStorage = async (filepath, filename) => {
   log(`✅ Upload OK: gs://${BUCKET_NAME}/backups/${filename}`)
 }
 
-// ── Supprimer les vieux backups ──────────────────────────────────
 export const cleanOldBackups = async () => {
   log(`🧹 Nettoyage des backups > ${RETENTION_DAYS} jours...`)
   const [files] = await storage.bucket(BUCKET_NAME).getFiles({ prefix: "backups/" })
@@ -98,15 +73,12 @@ export const cleanOldBackups = async () => {
   let deleted   = 0
   for (const file of files) {
     if (new Date(file.metadata.timeCreated).getTime() < cutoff) {
-      await file.delete()
-      log(`  🗑️  Supprimé: ${file.name}`)
-      deleted++
+      await file.delete(); log(`  🗑️  Supprimé: ${file.name}`); deleted++
     }
   }
   log(`🧹 ${deleted} fichier(s) supprimé(s)`)
 }
 
-// ── Lister les backups disponibles ──────────────────────────────
 export const listBackups = async () => {
   const [files] = await storage.bucket(BUCKET_NAME).getFiles({ prefix: "backups/" })
   return files
@@ -115,21 +87,17 @@ export const listBackups = async () => {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
 }
 
-// ── Restore depuis un fichier JSON ───────────────────────────────
 export const restoreFromJson = async (jsonPath, options = {}) => {
   const { collections = COLLECTIONS, dryRun = true, overwrite = false } = options
-  log(`🔄 Restore depuis: ${jsonPath}`)
-  log(`   dryRun: ${dryRun} | overwrite: ${overwrite} | collections: ${collections.join(", ")}`)
-
+  log(`🔄 Restore depuis: ${jsonPath} | dryRun: ${dryRun} | overwrite: ${overwrite}`)
   const backup = JSON.parse(fs.readFileSync(jsonPath, "utf-8"))
   const stats  = { restored: 0, skipped: 0, errors: 0 }
   log(`📅 Backup du: ${backup.meta?.timestamp || "inconnu"}`)
-
   for (const colName of collections) {
     if (!backup.data[colName]) { log(`  ⚠️ Collection ${colName} absente du backup`); continue }
     const docs = backup.data[colName]
     const ids  = Object.keys(docs).filter(k => !k.startsWith("_"))
-    log(`  📦 ${colName}: ${ids.length} documents à restaurer`)
+    log(`  📦 ${colName}: ${ids.length} documents`)
     for (const docId of ids) {
       try {
         if (!dryRun) {
@@ -142,15 +110,12 @@ export const restoreFromJson = async (jsonPath, options = {}) => {
       } catch(e) { log(`  ❌ ${colName}/${docId}: ${e.message}`); stats.errors++ }
     }
   }
-
   log(`✅ Restore terminé: ${stats.restored} restaurés, ${stats.skipped} ignorés, ${stats.errors} erreurs`)
   return stats
 }
 
-// ── Routes Express ───────────────────────────────────────────────
 const ADMIN_EMAILS = ["musmamon@gmail.com", "musrh@gmail.com"]
-
-const verifyAdmin = async (idToken) => {
+const verifyAdmin  = async (idToken) => {
   if (!idToken) throw Object.assign(new Error("Non authentifié"), { status: 401 })
   const decoded = await admin.auth().verifyIdToken(idToken)
   if (!ADMIN_EMAILS.includes(decoded.email?.toLowerCase()))
@@ -172,8 +137,7 @@ export const backupRoutes = (app) => {
   app.get("/api/admin/backups", async (req, res) => {
     try {
       await verifyAdmin(req.query.idToken)
-      const list = await listBackups()
-      res.json({ backups: list, count: list.length })
+      res.json({ backups: await listBackups(), count: (await listBackups()).length })
     } catch(e) { res.status(e.status || 500).json({ error: e.message }) }
   })
 
@@ -203,7 +167,6 @@ export const backupRoutes = (app) => {
   })
 }
 
-// ── Exécution directe (cron) — ESM: import.meta.url remplace require.main ──
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   ;(async () => {
     try {
@@ -211,11 +174,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       await uploadToStorage(filepath, filename)
       await cleanOldBackups()
       fs.unlinkSync(filepath)
-      log("🎉 Backup terminé avec succès !")
-      process.exit(0)
-    } catch(e) {
-      log(`💥 Erreur backup: ${e.message}`)
-      process.exit(1)
-    }
+      log("🎉 Backup terminé avec succès !"); process.exit(0)
+    } catch(e) { log(`💥 Erreur backup: ${e.message}`); process.exit(1) }
   })()
 }
