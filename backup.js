@@ -23,9 +23,6 @@ const COLLECTIONS = [
 ]
 
 // ── Init Firebase Admin ──────────────────────────────────────────
-if (!admin.apps.length) {
-  admin.initializeApp({ credential: admin.credential.cert(SERVICE_ACCOUNT) })
-}
 const db      = admin.firestore()
 const storage = new Storage({ credentials: SERVICE_ACCOUNT })
 
