@@ -674,6 +674,63 @@ const normalizeCurrency = (raw) => {
   return map[str] || map[raw.trim()] || "eur"  // fallback eur
 }
 
+
+// ================================================================
+//  POST /api/contact — Formulaire de contact → email propriétaire
+//  Variables requises : SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+// ================================================================
+app.post("/api/contact", async (req, res) => {
+  const { name, email, message, storeUid, siteSlug } = req.body
+  if (!name || !email || !message || !storeUid)
+    return res.status(400).json({ error: "Champs manquants" })
+  try {
+    const userSnap = await db.collection("users").doc(storeUid).get()
+    if (!userSnap.exists) return res.status(404).json({ error: "Store introuvable" })
+    const ownerEmail = userSnap.data().email
+    if (!ownerEmail) return res.status(400).json({ error: "Email propriétaire non configuré" })
+    const siteName = userSnap.data().siteName || siteSlug || storeUid
+
+    const nodemailer = (await import("nodemailer")).default
+    const transporter = nodemailer.createTransport({
+      host:   process.env.SMTP_HOST || "smtp.gmail.com",
+      port:   parseInt(process.env.SMTP_PORT || "587"),
+      secure: process.env.SMTP_PORT === "465",
+      auth: { user: process.env.SMTP_USER || process.env.EMAIL_FROM, pass: process.env.SMTP_PASS || process.env.EMAIL_PASS },
+    })
+    await transporter.sendMail({
+      from:    `"${siteName}" <${process.env.SMTP_USER || process.env.EMAIL_FROM}>`,
+      to:      ownerEmail,
+      replyTo: email,
+      subject: `Nouveau message de contact — ${siteName}`,
+      html: `<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto">
+        <div style="background:#6c63ff;padding:24px 28px;border-radius:12px 12px 0 0">
+          <h2 style="color:white;margin:0;font-size:20px">Nouveau message de contact</h2>
+          <p style="color:rgba(255,255,255,.8);margin:6px 0 0;font-size:14px">Via ${siteName}</p>
+        </div>
+        <div style="padding:28px;background:white;border-radius:0 0 12px 12px;border:1px solid #e5e7eb">
+          <table style="width:100%;border-collapse:collapse">
+            <tr><td style="padding:8px 0;font-size:13px;color:#6b7280;width:80px">Nom</td><td style="font-size:15px;font-weight:600">${name}</td></tr>
+            <tr><td style="padding:8px 0;font-size:13px;color:#6b7280">Email</td><td><a href="mailto:${email}" style="color:#6c63ff">${email}</a></td></tr>
+          </table>
+          <div style="margin-top:20px;padding:16px;background:#f9fafb;border-radius:8px;border-left:3px solid #6c63ff">
+            <p style="margin:0;font-size:13px;color:#6b7280;margin-bottom:8px">Message :</p>
+            <p style="margin:0;font-size:15px;line-height:1.7;white-space:pre-wrap">${message}</p>
+          </div>
+          <p style="margin-top:20px;font-size:12px;color:#9ca3af;text-align:center">
+            Recu le ${new Date().toLocaleString("fr-FR")} — Repondez directement a cet email pour contacter ${name}.
+          </p>
+        </div>
+      </div>`,
+      text: `Nouveau message — ${siteName}\n\nNom: ${name}\nEmail: ${email}\n\n${message}`,
+    })
+    console.log(`Email contact envoye a ${ownerEmail} (store: ${storeUid})`)
+    res.json({ success: true })
+  } catch(e) {
+    console.error("/api/contact:", e.message)
+    res.status(500).json({ error: e.message })
+  }
+})
+
 app.post("/create-store-session", async (req, res) => {
   try {
     let {
