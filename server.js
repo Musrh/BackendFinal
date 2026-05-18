@@ -42,6 +42,7 @@ import dotenv     from "dotenv"
 import bodyParser from "body-parser"
 import Groq       from "groq-sdk"
 import cron       from "node-cron"
+import nodemailer from "nodemailer"
 
 // ── Firebase Admin (singleton partagé) ───────────────────────
 import admin, { db } from "./firebase-admin.js"
@@ -690,7 +691,6 @@ app.post("/api/contact", async (req, res) => {
     if (!ownerEmail) return res.status(400).json({ error: "Email propriétaire non configuré" })
     const siteName = userSnap.data().siteName || siteSlug || storeUid
 
-    const nodemailer = (await import("nodemailer")).default
     const transporter = nodemailer.createTransport({
       host:   process.env.SMTP_HOST || "smtp.gmail.com",
       port:   parseInt(process.env.SMTP_PORT || "587"),
