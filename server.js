@@ -684,21 +684,50 @@ app.post("/api/contact", async (req, res) => {
   const { name, email, message, storeUid, siteSlug } = req.body
   if (!name || !email || !message || !storeUid)
     return res.status(400).json({ error: "Champs manquants" })
+
+  // Sauvegarder en Firestore d'abord (toujours)
   try {
-    const userSnap = await db.collection("users").doc(storeUid).get()
-    if (!userSnap.exists) return res.status(404).json({ error: "Store introuvable" })
-    const ownerEmail = userSnap.data().email
-    if (!ownerEmail) return res.status(400).json({ error: "Email propriétaire non configuré" })
-    const siteName = userSnap.data().siteName || siteSlug || storeUid
+    await db.collection("users").doc(storeUid)
+      .collection("contacts").add({
+        name, email, message,
+        siteSlug: siteSlug || storeUid,
+        status:   "nouveau",
+        createdAt: new Date().toISOString(),
+      })
+  } catch(e) {
+    console.error("/api/contact Firestore:", e.message)
+  }
+
+  // Envoyer par email seulement si SMTP est configuré
+  const smtpUser = process.env.SMTP_USER || process.env.EMAIL_FROM
+  const smtpPass = process.env.SMTP_PASS || process.env.EMAIL_PASS
+  if (!smtpUser || !smtpPass) {
+    console.warn("/api/contact: SMTP non configuré — message sauvegardé en Firestore uniquement")
+    return res.json({ success: true, emailSent: false })
+  }
+
+  try {
+    const userSnap  = await db.collection("users").doc(storeUid).get()
+    const ownerEmail = userSnap.exists ? userSnap.data().email : null
+    const siteName   = userSnap.exists ? (userSnap.data().siteName || siteSlug || storeUid) : storeUid
+
+    if (!ownerEmail) {
+      console.warn("/api/contact: email propriétaire absent — email non envoyé")
+      return res.json({ success: true, emailSent: false })
+    }
 
     const transporter = nodemailer.createTransport({
-      host:   process.env.SMTP_HOST || "smtp.gmail.com",
-      port:   parseInt(process.env.SMTP_PORT || "587"),
-      secure: process.env.SMTP_PORT === "465",
-      auth: { user: process.env.SMTP_USER || process.env.EMAIL_FROM, pass: process.env.SMTP_PASS || process.env.EMAIL_PASS },
+      host:             process.env.SMTP_HOST || "smtp.gmail.com",
+      port:             parseInt(process.env.SMTP_PORT || "587"),
+      secure:           process.env.SMTP_PORT === "465",
+      connectionTimeout: 10000,
+      greetingTimeout:   10000,
+      socketTimeout:     15000,
+      auth: { user: smtpUser, pass: smtpPass },
     })
+
     await transporter.sendMail({
-      from:    `"${siteName}" <${process.env.SMTP_USER || process.env.EMAIL_FROM}>`,
+      from:    `"${siteName}" <${smtpUser}>`,
       to:      ownerEmail,
       replyTo: email,
       subject: `Nouveau message de contact — ${siteName}`,
@@ -717,17 +746,19 @@ app.post("/api/contact", async (req, res) => {
             <p style="margin:0;font-size:15px;line-height:1.7;white-space:pre-wrap">${message}</p>
           </div>
           <p style="margin-top:20px;font-size:12px;color:#9ca3af;text-align:center">
-            Recu le ${new Date().toLocaleString("fr-FR")} — Repondez directement a cet email pour contacter ${name}.
+            Recu le ${new Date().toLocaleString("fr-FR")} — Repondez directement a cet email.
           </p>
         </div>
       </div>`,
       text: `Nouveau message — ${siteName}\n\nNom: ${name}\nEmail: ${email}\n\n${message}`,
     })
     console.log(`Email contact envoye a ${ownerEmail} (store: ${storeUid})`)
-    res.json({ success: true })
+    res.json({ success: true, emailSent: true })
+
   } catch(e) {
-    console.error("/api/contact:", e.message)
-    res.status(500).json({ error: e.message })
+    // Email échoue mais Firestore a déjà sauvegardé → succès quand même
+    console.error("/api/contact email:", e.message)
+    res.json({ success: true, emailSent: false, emailError: e.message })
   }
 })
 
