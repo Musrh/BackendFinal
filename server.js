@@ -295,74 +295,29 @@ const getStoreInfo = async (storeUid) => {
 }
 
 const getProduits = async (storeUid) => {
+  if (!storeUid) return []
   try {
-    let results = []
+    const snap = await db.collection("prodinfos")
+      .where("ownerUid", "==", storeUid)
+      .limit(100).get()
 
-    // Helper : normaliser un doc produit (gère nom/prix/desc et name/price/description)
-    const normalize = (p, src) => ({
-      id:          p.id          || String(p.name || p.nom || ""),
-      name:        p.name        || p.nom         || "Produit",
-      price:       p.price       !== undefined ? p.price : (p.prix !== undefined ? p.prix : 0),
-      description: p.description || p.desc        || "",
-      stock:       p.stock       !== undefined ? p.stock : "disponible",
-      currency:    p.currency    || p.devise       || "€",
-      badge:       p.badge       || "",
-      storeUid:    p.storeUid    || storeUid       || "",
-      source:      src           || "collection",
+    const results = snap.docs.map(d => {
+      const p = d.data()
+      return {
+        id:          d.id,
+        name:        p.name        || p.nom         || "Produit",
+        description: p.description || p.desc        || "",
+        price:       p.price       !== undefined ? p.price : (p.prix ?? 0),
+        currency:    p.currency    || p.devise       || "€",
+        badge:       p.badge       || "",
+        image:       p.image       || "",
+        stock:       p.stock       !== undefined ? p.stock : "disponible",
+      }
     })
 
-    const addIfNew = (raw, src) => {
-      const n = normalize(raw, src)
-      if (n.name && !results.find(r => r.name === n.name)) results.push(n)
-    }
-
-    // ── SOURCE 1 : siteData du store (PRINCIPALE) ─────────────
-    // Les produits affichés dans le store builder viennent de ici
-    if (storeUid) {
-      try {
-        const userDoc = await db.collection("users").doc(storeUid).get()
-        if (userDoc.exists) {
-          const siteData = userDoc.data().siteData
-          ;(siteData?.pages || []).forEach(page => {
-            ;(page.sections || []).forEach(section => {
-              if (section.type === "products" && Array.isArray(section.items)) {
-                section.items.forEach(p => addIfNew(p, "siteData"))
-              }
-            })
-          })
-          console.log(`📦 siteData(${storeUid}): ${results.length} produits`)
-        }
-      } catch(e) { console.warn("siteData:", e.message) }
-    }
-
-    // ── SOURCE 2 : prodinfos filtré par ownerUid (synchronisé depuis saveSite) ──
-    if (storeUid) {
-      try {
-        const snap = await db.collection("prodinfos")
-          .where("ownerUid", "==", storeUid).limit(100).get()
-        snap.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "prodinfos"))
-        console.log(`📦 prodinfos(${storeUid}): ${snap.docs.length} docs`)
-      } catch(e) { console.warn("prodinfos filtré:", e.message) }
-    }
-
-    // SOURCE 3 supprimée — les produits globaux sans filtre storeUid
-    // mélangent les produits de tous les stores → interdit
-
-    // ── SOURCE 4 : products filtré par storeUid ───────────────
-    if (storeUid) {
-      try {
-        const snap = await db.collection("products")
-          .where("storeUid", "==", storeUid).limit(100).get()
-        snap.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "products"))
-        console.log(`📦 products(${storeUid}): ${snap.docs.length} docs`)
-      } catch(e) { console.warn("products:", e.message) }
-    }
-
-    // SOURCE 5 supprimée — même raison que SOURCE 3
-
-    console.log(`✅ TOTAL ${results.length} produits pour storeUid=${storeUid || "global"}`)
+    console.log(`📦 prodinfos(${storeUid}): ${results.length} produits`)
     return results
-  } catch (e) {
+  } catch(e) {
     console.error("❌ getProduits:", e.message)
     return []
   }
