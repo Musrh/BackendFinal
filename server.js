@@ -270,6 +270,30 @@ app.use(express.json())
 // ===============================================================
 
 // Charger les produits depuis toutes les sources disponibles
+// Charger les infos du store (nom, description, email, politiques...)
+const getStoreInfo = async (storeUid) => {
+  try {
+    if (!storeUid) return {}
+    const snap = await db.collection("users").doc(storeUid).get()
+    if (!snap.exists) return {}
+    const d = snap.data()
+    return {
+      name:         d.siteName        || d.siteData?.siteName    || "",
+      description:  d.siteData?.siteDescription || d.description || "",
+      email:        d.email           || "",
+      phone:        d.phone           || d.siteData?.phone       || "",
+      address:      d.address         || d.siteData?.address     || "",
+      returnPolicy: d.returnPolicy    || d.siteData?.returnPolicy|| "",
+      deliveryInfo: d.deliveryInfo    || d.siteData?.deliveryInfo|| "",
+      currency:     d.currency        || "€",
+      lang:         d.lang            || "fr",
+    }
+  } catch(e) {
+    console.warn("getStoreInfo:", e.message)
+    return {}
+  }
+}
+
 const getProduits = async (storeUid) => {
   try {
     let results = []
@@ -311,25 +335,18 @@ const getProduits = async (storeUid) => {
       } catch(e) { console.warn("siteData:", e.message) }
     }
 
-    // ── SOURCE 2 : prodinfos filtré par storeUid ──────────────
+    // ── SOURCE 2 : prodinfos filtré par ownerUid (synchronisé depuis saveSite) ──
     if (storeUid) {
       try {
         const snap = await db.collection("prodinfos")
-          .where("storeUid", "==", storeUid).limit(100).get()
+          .where("ownerUid", "==", storeUid).limit(100).get()
         snap.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "prodinfos"))
         console.log(`📦 prodinfos(${storeUid}): ${snap.docs.length} docs`)
       } catch(e) { console.warn("prodinfos filtré:", e.message) }
     }
 
-    // ── SOURCE 3 : prodinfos GLOBAL (sans filtre storeUid) ────
-    // Cas où storeUid n'est pas encore dans prodinfos
-    if (results.length === 0) {
-      try {
-        const snap = await db.collection("prodinfos").limit(100).get()
-        snap.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "prodinfos-global"))
-        console.log(`📦 prodinfos(global): ${snap.docs.length} docs`)
-      } catch(e) { console.warn("prodinfos global:", e.message) }
-    }
+    // SOURCE 3 supprimée — les produits globaux sans filtre storeUid
+    // mélangent les produits de tous les stores → interdit
 
     // ── SOURCE 4 : products filtré par storeUid ───────────────
     if (storeUid) {
@@ -341,14 +358,7 @@ const getProduits = async (storeUid) => {
       } catch(e) { console.warn("products:", e.message) }
     }
 
-    // ── SOURCE 5 : products GLOBAL ────────────────────────────
-    if (results.length === 0) {
-      try {
-        const snap = await db.collection("products").limit(50).get()
-        snap.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "products-global"))
-        console.log(`📦 products(global): ${snap.docs.length} docs`)
-      } catch(e) { console.warn("products global:", e.message) }
-    }
+    // SOURCE 5 supprimée — même raison que SOURCE 3
 
     console.log(`✅ TOTAL ${results.length} produits pour storeUid=${storeUid || "global"}`)
     return results
@@ -357,67 +367,92 @@ const getProduits = async (storeUid) => {
     return []
   }
 }
-// Charger les commandes (cmdinfos + orders)
-const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
+// Charger les commandes d'un client connecté par son uid Firebase
+// Charger les commandes d'un client connecté — par clientUid ET customerEmail
+const getClientOrdersByUid = async (storeUid, clientUid) => {
+  if (!storeUid || !clientUid) return []
   try {
-    let results = []
+    // Récupérer d'abord l'email du client depuis Firebase Auth via Firestore
+    let clientEmail = null
+    try {
+      const userRecord = await admin.auth().getUser(clientUid)
+      clientEmail = userRecord.email?.toLowerCase() || null
+    } catch(e) { console.warn("getUser:", e.message) }
 
-    // cmdinfos par storeUid
-    if (storeUid) {
+    const results = []
+    const seen    = new Set()
+
+    for (const col of ["orders", "forders"]) {
+      // Recherche par clientUid
       try {
-        let q = db.collection("cmdinfos")
-        if (email) q = q.where("clientEmail", "==", email.trim().toLowerCase())
-        else if (nom) q = q.where("customerName", "==", nom)
-        else q = q.where("storeUid", "==", storeUid)
-        const snap = await q.limit(20).get()
-        results = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-        console.log(`📋 cmdinfos: ${results.length}`)
-      } catch(e) { console.warn("cmdinfos:", e.message) }
-    }
+        const snap = await db.collection(col)
+          .where("ownerUid",  "==", storeUid)
+          .where("clientUid", "==", clientUid)
+          .orderBy("createdAt", "desc").limit(20).get()
+        snap.docs.forEach(d => {
+          if (!seen.has(d.id)) { seen.add(d.id); results.push({ id: d.id, ...d.data(), _source: col }) }
+        })
+      } catch(e) { console.warn(`getClientOrdersByUid ${col} uid:`, e.message) }
 
-    // orders (Pro) + forders (Free) par clientId ou email
-    if (!results.length) {
-      for (const col of ["orders", "forders"]) {
+      // Recherche par customerEmail (fallback si clientUid absent sur anciennes commandes)
+      if (clientEmail) {
         try {
-          let q = db.collection(col)
-          if (email) q = q.where("email", "==", email.trim().toLowerCase())
-          else if (storeUid) q = q.where("ownerUid", "==", storeUid)
-          const snap = await q.limit(20).get()
-          const ids  = new Set(results.map(r => r.id))
-          const docs = snap.docs
-            .filter(d => !ids.has(d.id))
-            .map(d => ({
-              id: d.id, ...d.data(),
-              customerName:  d.data().customerName  || d.data().name  || "",
-              customerEmail: d.data().customerEmail || d.data().email || "",
-              _source: col,
-            }))
-          results = [...results, ...docs]
-          console.log(`📋 ${col}: ${docs.length} commandes`)
-        } catch(e) { console.warn(`${col} fallback:`, e.message) }
+          const snap = await db.collection(col)
+            .where("ownerUid",      "==", storeUid)
+            .where("customerEmail", "==", clientEmail)
+            .orderBy("createdAt", "desc").limit(20).get()
+          snap.docs.forEach(d => {
+            if (!seen.has(d.id)) { seen.add(d.id); results.push({ id: d.id, ...d.data(), _source: col }) }
+          })
+        } catch(e) { console.warn(`getClientOrdersByUid ${col} email:`, e.message) }
       }
     }
 
-    // users/{storeUid}/orders
-    if (storeUid) {
+    console.log(`📋 getClientOrdersByUid(${clientUid}/${clientEmail}): ${results.length} commandes`)
+    return results
+  } catch(e) {
+    console.error("❌ getClientOrdersByUid:", e.message)
+    return []
+  }
+}
+
+// Charger les commandes depuis orders + forders par email du client
+const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
+  if (!storeUid) return []
+  try {
+    let results = []
+    const emailNorm = email?.trim().toLowerCase()
+
+    for (const col of ["orders", "forders"]) {
       try {
-        let q = db.collection("users").doc(storeUid).collection("orders")
-        if (email) q = q.where("customerEmail", "==", email.trim().toLowerCase())
-        const snap = await q.limit(20).get()
+        let q = db.collection(col).where("ownerUid", "==", storeUid)
+        // Filtrer par email du client si fourni
+        if (emailNorm) q = q.where("customerEmail", "==", emailNorm)
+        const snap = await q.orderBy("createdAt", "desc").limit(20).get()
         const ids  = new Set(results.map(r => r.id))
-        snap.docs.filter(d => !ids.has(d.id)).forEach(d =>
-          results.push({ id: d.id, ...d.data() })
-        )
-      } catch(e) { console.warn("users/orders:", e.message) }
+        snap.docs.filter(d => !ids.has(d.id)).forEach(d => {
+          const data = d.data()
+          results.push({
+            id:            d.id,
+            ...data,
+            customerName:  data.customerName  || data.name  || "",
+            customerEmail: data.customerEmail || data.email || "",
+            _source:       col,
+          })
+        })
+        console.log(`📋 ${col}(${storeUid}): ${snap.docs.length} commandes`)
+      } catch(e) { console.warn(`getCmdinfos ${col}:`, e.message) }
     }
 
-    // Filtres
-    if (nom)  results = results.filter(r => (r.customerName||"").toLowerCase().includes(nom.toLowerCase()))
-    if (date) results = results.filter(r => String(r.createdAt||"").includes(date))
-    if (email) results = results.filter(r =>
-      (r.customerEmail||r.email||"").toLowerCase() === email.trim().toLowerCase()
+    // Filtres post-requête
+    if (nom)  results = results.filter(r =>
+      (r.customerName || "").toLowerCase().includes(nom.toLowerCase())
+    )
+    if (date) results = results.filter(r =>
+      String(r.createdAt || "").includes(date)
     )
 
+    console.log(`📋 getCmdinfos total: ${results.length} commandes pour ${storeUid}`)
     return results
   } catch(e) {
     console.error("❌ getCmdinfos:", e.message)
@@ -481,51 +516,71 @@ const buildCmdContext = (cmds) => {
 app.post("/api/assistant", async (req, res) => {
   const {
     message,
-    history    = [],
+    history     = [],
     storeUid,
-    storeEmail,
-    storeName,
-    lang       = "fr",
-    clientInfo = {}
+    lang        = "fr",
+    clientUid   = null,   // uid Firebase du client connecté (priorité)
+    clientInfo  = {},     // { email, nom, date } si non connecté
   } = req.body
 
   if (!message) return res.status(400).json({ error: "message requis" })
 
   try {
-    console.log(`🤖 Assistant | storeUid=${storeUid} | lang=${lang} | msg="${message.slice(0,60)}"`)
+    console.log(`🤖 Assistant | storeUid=${storeUid} | lang=${lang} | clientUid=${clientUid} | msg="${message.slice(0,60)}"`)
 
-    const [produits, cmds] = await Promise.all([
+    // Charger en parallèle : infos store + produits + commandes client
+    const [storeInfo, produits, cmds] = await Promise.all([
+      getStoreInfo(storeUid),
       getProduits(storeUid),
-      (clientInfo.email || clientInfo.nom)
-        ? getCmdinfos(storeUid, clientInfo)
-        : Promise.resolve([]),
+      clientUid
+        ? getClientOrdersByUid(storeUid, clientUid)                          // client connecté → ses commandes précises
+        : (clientInfo.email || clientInfo.nom)
+          ? getCmdinfos(storeUid, clientInfo)                                // non connecté → recherche par email/nom
+          : Promise.resolve([]),
     ])
-    console.log(`📊 Contexte: ${produits.length} produits, ${cmds.length} commandes`)
+    console.log(`📊 Contexte: ${produits.length} produits, ${cmds.length} commandes | store: ${storeInfo.name}`)
 
     const produitsCtx = buildProduitsContext(produits)
     const cmdsCtx     = cmds.length ? buildCmdContext(cmds) : ""
+    const langLabel   = { fr: "français", ar: "arabe", es: "espagnol", en: "anglais" }[lang] || "français"
 
-    const langLabel = { fr: "français", ar: "arabe", es: "espagnol", en: "anglais" }[lang] || "français"
+    // Bloc infos store
+    const storeCtx = [
+      storeInfo.name        && `Nom du store : ${storeInfo.name}`,
+      storeInfo.description && `Description : ${storeInfo.description}`,
+      storeInfo.email       && `Email contact : ${storeInfo.email}`,
+      storeInfo.phone       && `Téléphone : ${storeInfo.phone}`,
+      storeInfo.address     && `Adresse : ${storeInfo.address}`,
+      storeInfo.deliveryInfo  && `Livraison : ${storeInfo.deliveryInfo}`,
+      storeInfo.returnPolicy  && `Politique retour : ${storeInfo.returnPolicy}`,
+      `Devise : ${storeInfo.currency || "€"}`,
+    ].filter(Boolean).join("
+")
 
     const systemPrompt = `
-Tu es l'assistant IA du store "${storeName || "notre boutique"}".
-Tu aides les clients. Tu réponds en ${langLabel}. Sois chaleureux, professionnel et concis.
+Tu es l'assistant IA du store "${storeInfo.name || "notre boutique"}".
+Tu aides UNIQUEMENT les clients DE CE STORE. Tu réponds en ${langLabel}. Sois chaleureux, professionnel et concis.
 
-=== CATALOGUE PRODUITS ===
+=== INFORMATIONS DU STORE ===
+${storeCtx || "Informations non disponibles."}
+
+=== CATALOGUE PRODUITS (${produits.length} produits) ===
 ${produitsCtx}
 
 === COMMANDES DU CLIENT ===
-${cmdsCtx || "Aucune commande chargée. Si le client demande sa commande, invite-le à fournir son email et sa date de commande."}
+${cmdsCtx || (clientUid
+  ? "Ce client n'a pas encore de commandes dans ce store."
+  : "Client non identifié. Si le client demande sa commande, invite-le à se connecter ou à fournir son email et sa date de commande."
+)}
 
-=== RÈGLES ===
-1. Pour les PRODUITS : informe sur prix, description, disponibilité depuis le catalogue ci-dessus.
-2. Pour les COMMANDES : demande nom + email + date si pas fournis.
-3. Si tu ne trouves PAS la réponse : réponds exactement :
+=== RÈGLES STRICTES ===
+1. PRODUITS : réponds uniquement sur les produits listés ci-dessus. Ne jamais inventer un prix ou une description.
+2. COMMANDES : si le client demande sa commande et qu'il n'est pas connecté, demande-lui son email et sa date de commande.
+3. HORS SUJET : si la question ne concerne pas ce store ou ses produits, redirige poliment.
+4. Si tu ne trouves PAS la réponse, réponds exactement :
    {"action":"SHOW_REQUEST_FORM","reason":"[raison]"}
-4. Pour sauvegarder une requête : réponds exactement :
+5. Pour sauvegarder une requête client :
    {"action":"SAVE_REQUEST","data":{"nom":"...","email":"...","telephone":"...","question":"..."}}
-5. Ne jamais inventer des prix ou informations absents du catalogue.
-6. Email du store : ${storeEmail || "contactez-nous via le formulaire"}
 `.trim()
 
     const messages = [
@@ -574,8 +629,10 @@ ${cmdsCtx || "Aucune commande chargée. Si le client demande sa commande, invite
       action,
       actionData,
       debug: {
+        storeName:     storeInfo.name,
         produitsCount: produits.length,
         cmdsCount:     cmds.length,
+        clientUid:     clientUid || null,
         storeUid,
       }
     })
