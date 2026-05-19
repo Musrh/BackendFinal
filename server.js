@@ -554,8 +554,7 @@ app.post("/api/assistant", async (req, res) => {
       storeInfo.deliveryInfo  && `Livraison : ${storeInfo.deliveryInfo}`,
       storeInfo.returnPolicy  && `Politique retour : ${storeInfo.returnPolicy}`,
       `Devise : ${storeInfo.currency || "€"}`,
-    ].filter(Boolean).join("
-")
+    ].filter(Boolean).join("\n")
 
     const systemPrompt = `
 Tu es l'assistant IA du store "${storeInfo.name || "notre boutique"}".
