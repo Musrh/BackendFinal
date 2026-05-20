@@ -338,29 +338,24 @@ const getClientOrdersByUid = async (storeUid, clientUid) => {
     const seen    = new Set()
 
     for (const col of ["orders", "forders"]) {
-      // Recherche par clientUid
+      // Requête par ownerUid — filtrage clientUid/email côté serveur (pas d'index composite)
       try {
         const snap = await db.collection(col)
-          .where("ownerUid",  "==", storeUid)
-          .where("clientUid", "==", clientUid)
-          .orderBy("createdAt", "desc").limit(20).get()
-        snap.docs.forEach(d => {
-          if (!seen.has(d.id)) { seen.add(d.id); results.push({ id: d.id, ...d.data(), _source: col }) }
-        })
-      } catch(e) { console.warn(`getClientOrdersByUid ${col} uid:`, e.message) }
+          .where("ownerUid", "==", storeUid)
+          .limit(100).get()
 
-      // Recherche par customerEmail (fallback si clientUid absent sur anciennes commandes)
-      if (clientEmail) {
-        try {
-          const snap = await db.collection(col)
-            .where("ownerUid",      "==", storeUid)
-            .where("customerEmail", "==", clientEmail)
-            .orderBy("createdAt", "desc").limit(20).get()
-          snap.docs.forEach(d => {
-            if (!seen.has(d.id)) { seen.add(d.id); results.push({ id: d.id, ...d.data(), _source: col }) }
-          })
-        } catch(e) { console.warn(`getClientOrdersByUid ${col} email:`, e.message) }
-      }
+        snap.docs.forEach(d => {
+          if (seen.has(d.id)) return
+          const data      = d.data()
+          const docEmail  = (data.customerEmail || data.email || "").toLowerCase()
+          const docUid    = data.clientUid || ""
+          // Garder si correspond au clientUid OU à l'email
+          if (docUid !== clientUid && (!clientEmail || docEmail !== clientEmail)) return
+          seen.add(d.id)
+          results.push({ id: d.id, ...data, customerEmail: docEmail, _source: col })
+        })
+        console.log(`📋 ${col}(${storeUid}): filtré pour uid=${clientUid} email=${clientEmail}: ${results.length}`)
+      } catch(e) { console.warn(`getClientOrdersByUid ${col}:`, e.message) }
     }
 
     console.log(`📋 getClientOrdersByUid(${clientUid}/${clientEmail}): ${results.length} commandes`)
@@ -377,35 +372,50 @@ const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
   try {
     let results = []
     const emailNorm = email?.trim().toLowerCase()
+    const seen      = new Set()
 
     for (const col of ["orders", "forders"]) {
       try {
-        let q = db.collection(col).where("ownerUid", "==", storeUid)
-        // Filtrer par email du client si fourni
-        if (emailNorm) q = q.where("customerEmail", "==", emailNorm)
-        const snap = await q.orderBy("createdAt", "desc").limit(20).get()
-        const ids  = new Set(results.map(r => r.id))
-        snap.docs.filter(d => !ids.has(d.id)).forEach(d => {
+        // Requête 1 : par ownerUid uniquement (pas d'index composite requis)
+        const snap = await db.collection(col)
+          .where("ownerUid", "==", storeUid)
+          .limit(100).get()
+
+        snap.docs.forEach(d => {
+          if (seen.has(d.id)) return
           const data = d.data()
+          const docEmail = (data.customerEmail || data.email || "").toLowerCase()
+
+          // Filtrer par email côté client (évite l'index composite)
+          if (emailNorm && docEmail && docEmail !== emailNorm) return
+
+          seen.add(d.id)
           results.push({
             id:            d.id,
             ...data,
             customerName:  data.customerName  || data.name  || "",
-            customerEmail: data.customerEmail || data.email || "",
+            customerEmail: docEmail,
             _source:       col,
           })
         })
-        console.log(`📋 ${col}(${storeUid}): ${snap.docs.length} commandes`)
+        console.log(`📋 ${col}(${storeUid}): ${snap.docs.length} docs, filtrés: ${results.length}`)
       } catch(e) { console.warn(`getCmdinfos ${col}:`, e.message) }
     }
 
-    // Filtres post-requête
+    // Filtres post-requête supplémentaires
     if (nom)  results = results.filter(r =>
       (r.customerName || "").toLowerCase().includes(nom.toLowerCase())
     )
     if (date) results = results.filter(r =>
       String(r.createdAt || "").includes(date)
     )
+
+    // Trier par date décroissante côté serveur
+    results.sort((a, b) => {
+      const da = a.createdAt ? new Date(a.createdAt) : 0
+      const db_ = b.createdAt ? new Date(b.createdAt) : 0
+      return db_ - da
+    })
 
     console.log(`📋 getCmdinfos total: ${results.length} commandes pour ${storeUid}`)
     return results
