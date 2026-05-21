@@ -509,43 +509,56 @@ app.post("/api/assistant", async (req, res) => {
     const cmdsCtx     = cmds.length ? buildCmdContext(cmds) : ""
     const langLabel   = { fr: "français", ar: "arabe", es: "espagnol", en: "anglais" }[lang] || "français"
 
-    // Bloc infos store
+    // Email du client identifié
+    const clientEmail = clientInfo?.email || ""
+
+    // Bloc infos store — sans email propriétaire (évite confusion avec email client)
     const storeCtx = [
-      storeInfo.name        && `Nom du store : ${storeInfo.name}`,
-      storeInfo.description && `Description : ${storeInfo.description}`,
-      storeInfo.email       && `Email contact : ${storeInfo.email}`,
-      storeInfo.phone       && `Téléphone : ${storeInfo.phone}`,
-      storeInfo.address     && `Adresse : ${storeInfo.address}`,
+      storeInfo.name          && `Nom du store : ${storeInfo.name}`,
+      storeInfo.description   && `Description : ${storeInfo.description}`,
+      storeInfo.phone         && `Téléphone : ${storeInfo.phone}`,
+      storeInfo.address       && `Adresse : ${storeInfo.address}`,
       storeInfo.deliveryInfo  && `Livraison : ${storeInfo.deliveryInfo}`,
       storeInfo.returnPolicy  && `Politique retour : ${storeInfo.returnPolicy}`,
       `Devise : ${storeInfo.currency || "€"}`,
     ].filter(Boolean).join("\n")
 
-    const systemPrompt = `
-Tu es l'assistant IA du store "${storeInfo.name || "notre boutique"}".
-Tu aides UNIQUEMENT les clients DE CE STORE. Tu réponds en ${langLabel}. Sois chaleureux, professionnel et concis.
+    // Identité du client
+    const clientCtx = clientEmail
+      ? `Email : ${clientEmail}`
+      : clientUid
+        ? `Client connecté (uid: ${clientUid})`
+        : "Non identifié"
 
-=== INFORMATIONS DU STORE ===
+    const noOrderMsg = (clientUid || clientEmail)
+      ? `Aucune commande trouvée pour ce client (${clientEmail || clientUid}).`
+      : "Client non identifié. Demande son email pour rechercher sa commande."
+
+    const systemPrompt = `Tu es l'assistant IA du store "${storeInfo.name || "notre boutique"}". Tu réponds en ${langLabel}. Sois chaleureux, professionnel et concis.
+
+RÈGLE CRITIQUE : Ne JAMAIS confondre l'email du propriétaire du store avec l'email du client.
+L'email du propriétaire n'est PAS dans ce prompt. Le client qui te parle est identifié ci-dessous.
+
+=== STORE ===
 ${storeCtx || "Informations non disponibles."}
 
-=== CATALOGUE PRODUITS (${produits.length} produits) ===
+=== CLIENT QUI PARLE ===
+${clientCtx}
+
+=== CATALOGUE (${produits.length} produits) ===
 ${produitsCtx}
 
-=== COMMANDES DU CLIENT ===
-${cmdsCtx || (clientUid
-  ? "Ce client n'a pas encore de commandes dans ce store."
-  : "Client non identifié. Si le client demande sa commande, invite-le à se connecter ou à fournir son email et sa date de commande."
-)}
+=== COMMANDES DE CE CLIENT ===
+${cmdsCtx || noOrderMsg}
 
-=== RÈGLES STRICTES ===
-1. PRODUITS : réponds uniquement sur les produits listés ci-dessus. Ne jamais inventer un prix ou une description.
-2. COMMANDES : si le client demande sa commande et qu'il n'est pas connecté, demande-lui son email et sa date de commande.
-3. HORS SUJET : si la question ne concerne pas ce store ou ses produits, redirige poliment.
-4. Si tu ne trouves PAS la réponse, réponds exactement :
-   {"action":"SHOW_REQUEST_FORM","reason":"[raison]"}
-5. Pour sauvegarder une requête client :
-   {"action":"SAVE_REQUEST","data":{"nom":"...","email":"...","telephone":"...","question":"..."}}
-`.trim()
+=== RÈGLES ===
+1. Produits : réponds uniquement sur le catalogue ci-dessus. Ne jamais inventer.
+2. Commandes : elles appartiennent UNIQUEMENT au client identifié ci-dessus. Ne pas les attribuer à quelqu'un d'autre.
+3. Si client non identifié demande sa commande : demande son email.
+4. Hors sujet : redirige poliment.
+5. Réponse inconnue : {"action":"SHOW_REQUEST_FORM","reason":"[raison]"}
+6. Sauvegarder requête : {"action":"SAVE_REQUEST","data":{"nom":"...","email":"...","telephone":"...","question":"..."}}`.trim()
+
 
     const messages = [
       { role: "system", content: systemPrompt },
