@@ -801,6 +801,17 @@ app.post("/api/contact", async (req, res) => {
   }
 })
 
+// ===============================================================
+//  POST /create-store-session — Paiement client (carte uniquement)
+//
+//  CORRECTION : payment_method_types: ["card"] garantit que seul
+//  le paiement par carte bancaire est proposé. Le bouton "Payer
+//  avec Link" ne s'affiche plus sur la page de paiement Stripe.
+//
+//  ⚠️  Si le bouton Link apparaît encore, désactivez-le aussi
+//  dans votre tableau de bord Stripe :
+//  Settings → Payment methods → Link → Désactiver
+// ===============================================================
 app.post("/create-store-session", async (req, res) => {
   try {
     let {
@@ -833,6 +844,11 @@ app.post("/create-store-session", async (req, res) => {
     if (invalidItem) return res.status(400).json({ error: `Prix invalide pour: ${invalidItem.nom}` })
 
     const session = await stripe.checkout.sessions.create({
+      // ─────────────────────────────────────────────────────
+      // CORRECTION : on force uniquement le paiement par carte.
+      // Cela supprime le bouton "Payer avec Link" de la page
+      // de paiement Stripe Checkout.
+      // ─────────────────────────────────────────────────────
       payment_method_types: ["card"],
       customer_email: email || undefined,
       line_items: items.map(item => ({
