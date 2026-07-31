@@ -60,7 +60,36 @@ const PORT = process.env.PORT || 8080
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }))
 
 // ── Stripe ────────────────────────────────────────────────────
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
+// Deux environnements sur le même compte Stripe :
+//  - LIVE : comptes payants (pro/premium/basic) → vrais paiements
+//  - TEST : comptes gratuits (free) → aucun vrai encaissement possible
+// STRIPE_SECRET_KEY_LIVE / STRIPE_SECRET_KEY_TEST doivent être définies.
+// Fallback sur STRIPE_SECRET_KEY (ancienne variable) si les nouvelles
+// ne sont pas encore configurées, pour ne rien casser en prod.
+const stripeLive = new Stripe(process.env.STRIPE_SECRET_KEY_LIVE || process.env.STRIPE_SECRET_KEY)
+const stripeTest = new Stripe(process.env.STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY)
+
+// Client par défaut (compat avec le code existant qui utilise encore `stripe`)
+const stripe = stripeLive
+
+// Sélectionne le bon client Stripe selon le plan du compte.
+// plan === "free" (ou absent) → mode test | tout le reste → mode live
+function getStripeClient(plan) {
+  return plan === "free" ? stripeTest : stripeLive
+}
+
+// Récupère le plan réel d'un owner depuis Firestore (source de vérité),
+// avec repli sur la valeur envoyée par le client si l'utilisateur est introuvable.
+async function resolveOwnerPlan(ownerUid, fallbackPlan) {
+  if (!ownerUid) return fallbackPlan || "free"
+  try {
+    const snap = await db.collection("users").doc(ownerUid).get()
+    if (snap.exists && snap.data().plan) return snap.data().plan
+  } catch (e) {
+    console.warn("resolveOwnerPlan:", e.message)
+  }
+  return fallbackPlan || "free"
+}
 
 // ── Groq ──────────────────────────────────────────────────────
 const groq = new Groq({
@@ -77,11 +106,28 @@ const FRONTEND_GENERATOR = FRONTEND   // SaasBuilder (stores clients)
 app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
   const sig = req.headers["stripe-signature"]
   let event
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET)
-  } catch (err) {
-    console.error("❌ Webhook signature error:", err.message)
-    return res.status(400).send(`Webhook Error: ${err.message}`)
+
+  // Le même endpoint reçoit les events live ET test (deux webhooks Stripe
+  // enregistrés sur cette même URL, chacun avec son propre secret de signature).
+  const webhookSecrets = [
+    process.env.STRIPE_WEBHOOK_SECRET_LIVE || process.env.STRIPE_WEBHOOK_SECRET,
+    process.env.STRIPE_WEBHOOK_SECRET_TEST,
+  ].filter(Boolean)
+
+  let verifyError
+  for (const secret of webhookSecrets) {
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, secret)
+      verifyError = null
+      break
+    } catch (err) {
+      verifyError = err
+    }
+  }
+
+  if (!event) {
+    console.error("❌ Webhook signature error:", verifyError?.message)
+    return res.status(400).send(`Webhook Error: ${verifyError?.message}`)
   }
 
   console.log("📨 EVENT TYPE:", event.type)
@@ -832,7 +878,12 @@ app.post("/create-store-session", async (req, res) => {
     const invalidItem = items.find(i => !i.prix || i.prix <= 0)
     if (invalidItem) return res.status(400).json({ error: `Prix invalide pour: ${invalidItem.nom}` })
 
-    const session = await stripe.checkout.sessions.create({
+    // Compte gratuit → mode test Stripe (aucun vrai encaissement) | payant → mode live
+    const resolvedPlan  = await resolveOwnerPlan(ownerUid, plan)
+    const storeStripe   = getStripeClient(resolvedPlan)
+    console.log(`💳 create-store-session — plan: ${resolvedPlan} → mode ${resolvedPlan === "free" ? "TEST" : "LIVE"}`)
+
+    const session = await storeStripe.checkout.sessions.create({
       payment_method_types: ["card"],
       customer_email: email || undefined,
       line_items: items.map(item => ({
@@ -988,8 +1039,12 @@ app.post("/force-upgrade", async (req, res) => {
 app.post("/create-connect-account", async (req, res) => {
   try {
     const { ownerUid, email } = req.body
-    const userRef = db.collection("users").doc(ownerUid)
-    const userDoc = await userRef.get()
+    const userRef  = db.collection("users").doc(ownerUid)
+    const userDoc  = await userRef.get()
+    const plan     = userDoc.exists ? userDoc.data().plan : "free"
+    const connectStripe = getStripeClient(plan)
+    const mode     = plan === "free" ? "test" : "live"
+
     let accountId = userDoc.exists && userDoc.data().stripeAccountId
       ? userDoc.data().stripeAccountId
       : null
@@ -997,9 +1052,16 @@ app.post("/create-connect-account", async (req, res) => {
     // Le compte a pu être supprimé manuellement dans le dashboard Stripe
     // (hors de l'app) : Firestore garde alors un stripeAccountId périmé.
     // On vérifie qu'il existe encore avant de le réutiliser.
+    // On revérifie aussi que le compte stocké correspond bien au mode
+    // attendu (ex: un owner passé de free → pro doit avoir un compte live).
+    if (accountId && userDoc.data().stripeMode && userDoc.data().stripeMode !== mode) {
+      console.warn(`⚠️ Owner ${ownerUid}: plan a changé (${userDoc.data().stripeMode} → ${mode}) — recréation du compte Connect`)
+      accountId = null
+    }
+
     if (accountId) {
       try {
-        await stripe.accounts.retrieve(accountId)
+        await connectStripe.accounts.retrieve(accountId)
       } catch (e) {
         console.warn(`⚠️ Compte Stripe ${accountId} introuvable (${e.message}) — recréation pour ${ownerUid}`)
         accountId = null
@@ -1007,7 +1069,7 @@ app.post("/create-connect-account", async (req, res) => {
     }
 
     if (!accountId) {
-      const account = await stripe.accounts.create({ type: "express", email })
+      const account = await connectStripe.accounts.create({ type: "express", email })
       accountId = account.id
     }
 
@@ -1015,18 +1077,19 @@ app.post("/create-connect-account", async (req, res) => {
     // L'admin SaaS devra vérifier dans Stripe et activer manuellement
     await userRef.set({
       stripeAccountId: accountId,
+      stripeMode:      mode,            // ← "test" (free) ou "live" (payant)
       stripeVerified:  false,          // ← en attente de vérification admin
       stripeSubmittedAt: Date.now(),   // ← date de soumission
     }, { merge: true })
 
-    const link = await stripe.accountLinks.create({
+    const link = await connectStripe.accountLinks.create({
       account:     accountId,
       refresh_url: `${FRONTEND_BUILDER}/#/reauth`,
       return_url:  `${FRONTEND_BUILDER}/#/dashboard?stripe=pending`,
       type:        "account_onboarding",
     })
 
-    console.log(`🔗 Stripe Connect soumis: ${ownerUid} | account: ${accountId}`)
+    console.log(`🔗 Stripe Connect soumis: ${ownerUid} | account: ${accountId} | mode: ${mode}`)
     res.json({ url: link.url })
   } catch (err) {
     console.error("❌ create-connect-account:", err.message)
@@ -1063,8 +1126,9 @@ app.post("/api/admin/verify-stripe", async (req, res) => {
     }
 
     if (approve) {
-      // Vérifier l'état réel du compte dans Stripe
-      const account = await stripe.accounts.retrieve(accountId)
+      // Vérifier l'état réel du compte dans Stripe (dans le bon mode : test ou live)
+      const verifyStripe = getStripeClient(userData.stripeMode === "test" ? "free" : "pro")
+      const account = await verifyStripe.accounts.retrieve(accountId)
       const chargesEnabled  = account.charges_enabled
       const payoutsEnabled  = account.payouts_enabled
       const detailsSubmitted = account.details_submitted
@@ -1153,7 +1217,10 @@ app.get("/", (req, res) => {
     service:  "SaasBuilder + SaasBuilder Backend",
     groq:     process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY ? "✅ configuré" : "❌ clé manquante",
     firebase: admin.apps.length ? "✅ configuré" : "❌ non configuré",
-    stripe:   process.env.STRIPE_SECRET_KEY ? "✅ configuré" : "❌ clé manquante",
+    stripe:   {
+      live: (process.env.STRIPE_SECRET_KEY_LIVE || process.env.STRIPE_SECRET_KEY) ? "✅ configuré" : "❌ clé manquante",
+      test: process.env.STRIPE_SECRET_KEY_TEST ? "✅ configuré" : "❌ clé manquante",
+    },
     backup:   process.env.BACKUP_BUCKET ? `✅ bucket: ${process.env.BACKUP_BUCKET}` : "❌ BACKUP_BUCKET manquant",
     endpoints: [
       "POST /create-billing-session",
@@ -1288,7 +1355,7 @@ app.listen(PORT, () => {
   console.log(`🚀 Backend running on port ${PORT}`)
   console.log(`🤖 Groq:     ${process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY ? "✅" : "❌ VITE_GROQ_API_KEY manquant"}`)
   console.log(`🔥 Firebase: ${admin.apps.length ? "✅" : "❌ FIREBASE_SERVICE_ACCOUNT manquant"}`)
-  console.log(`💳 Stripe:   ${process.env.STRIPE_SECRET_KEY ? "✅" : "❌ STRIPE_SECRET_KEY manquant"}`)
+  console.log(`💳 Stripe LIVE: ${(process.env.STRIPE_SECRET_KEY_LIVE || process.env.STRIPE_SECRET_KEY) ? "✅" : "❌ manquant"} | TEST: ${process.env.STRIPE_SECRET_KEY_TEST ? "✅" : "❌ manquant"}`)
   console.log(`☁️  Backup:   ${process.env.BACKUP_BUCKET ? `✅ bucket: ${process.env.BACKUP_BUCKET}` : "❌ BACKUP_BUCKET manquant"}`)
   console.log(`⏰ Cron:     Expiry 01h00 | Backup 02h00 UTC`)
 })
