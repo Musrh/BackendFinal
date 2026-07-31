@@ -895,7 +895,7 @@ app.post("/create-store-session", async (req, res) => {
         quantity: item.quantity,
       })),
       mode: "payment",
-      success_url: successUrl || `${FRONTEND_GENERATOR}/`,
+      success_url: successUrl || `${FRONTEND_GENERATOR}/payment-success`,
       cancel_url:  cancelUrl  || `${FRONTEND_GENERATOR}/payment-cancel`,
       metadata: {
         data: JSON.stringify({
@@ -1073,14 +1073,25 @@ app.post("/create-connect-account", async (req, res) => {
       accountId = account.id
     }
 
-    // Toujours marquer stripeVerified: false quand le propriétaire (re)configure
-    // L'admin SaaS devra vérifier dans Stripe et activer manuellement
+    // Compte gratuit (mode test) → activation immédiate, sans revue admin :
+    // aucun vrai encaissement n'est possible en mode test, donc pas besoin
+    // de vérifier des informations réelles. Seuls les comptes payants (live)
+    // passent par la vérification manuelle admin (/api/admin/verify-stripe),
+    // car là le propriétaire doit fournir des informations exactes pour
+    // recevoir de vrais paiements.
+    const autoActivate = mode === "test"
+
     await userRef.set({
       stripeAccountId: accountId,
       stripeMode:      mode,            // ← "test" (free) ou "live" (payant)
-      stripeVerified:  false,          // ← en attente de vérification admin
+      stripeVerified:  autoActivate,     // ← activé direct en test, sinon en attente admin
       stripeSubmittedAt: Date.now(),   // ← date de soumission
+      ...(autoActivate ? { stripeActivatedAt: Date.now() } : {}),
     }, { merge: true })
+
+    if (autoActivate) {
+      console.log(`⚡ Compte test auto-activé: ${ownerUid} | account: ${accountId}`)
+    }
 
     const link = await connectStripe.accountLinks.create({
       account:     accountId,
