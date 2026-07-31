@@ -922,6 +922,33 @@ app.post("/create-store-session", async (req, res) => {
   }
 })
 // ===============================================================
+//  GET /verify-store-session — Confirme qu'un paiement a réellement
+//  abouti auprès de Stripe (protège contre un retour arrière / bfcache
+//  qui réafficherait PaymentSuccess sans paiement réel).
+// ===============================================================
+app.get("/verify-store-session", async (req, res) => {
+  const { session_id } = req.query
+  if (!session_id) return res.status(400).json({ error: "session_id manquant" })
+
+  // On ne sait pas a priori si la session est en mode test ou live :
+  // on essaie les deux clients Stripe.
+  for (const client of [stripeLive, stripeTest]) {
+    try {
+      const session = await client.checkout.sessions.retrieve(session_id)
+      return res.json({
+        paid:         session.payment_status === "paid",
+        status:       session.payment_status,
+        amount_total: session.amount_total,
+        currency:     session.currency,
+      })
+    } catch (e) {
+      // pas la bonne session/mode, on essaie le client suivant
+    }
+  }
+
+  return res.status(404).json({ error: "Session Stripe introuvable" })
+})
+// ===============================================================
 //  POST /create-stripe-session — Alias de create-store-session
 //  (SiteViewer appelle cfg.backendUrl qui pointe vers cette route)
 // ===============================================================
