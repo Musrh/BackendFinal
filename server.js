@@ -895,8 +895,8 @@ app.post("/create-store-session", async (req, res) => {
         quantity: item.quantity,
       })),
       mode: "payment",
-      success_url: successUrl || `${FRONTEND_GENERATOR}/payment-success`,
-      cancel_url:  cancelUrl  || `${FRONTEND_GENERATOR}/payment-cancel`,
+      success_url: successUrl || `${FRONTEND_GENERATOR}/#/payment-success`,
+      cancel_url:  cancelUrl  || `${FRONTEND_GENERATOR}/#/payment-cancel`,
       metadata: {
         data: JSON.stringify({
           type:             "store_payment",
