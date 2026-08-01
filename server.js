@@ -914,7 +914,7 @@ app.post("/create-store-session", async (req, res) => {
     })
 
     console.log("🧾 Stripe session OK:", session.id)
-    res.json({ url: session.url })
+    res.json({ url: session.url, sessionId: session.id })
 
   } catch (err) {
     console.error("❌ create-store-session:", err.message)
