@@ -887,6 +887,9 @@ app.get("/verify-store-session", async (req, res) => {
       status:       session.payment_status,
       amount_total: session.amount_total,
       currency:     session.currency,
+      // ── Debug temporaire : à retirer une fois le mystère de l'URL résolu ──
+      success_url:  session.success_url,
+      cancel_url:   session.cancel_url,
     })
   } catch (e) {
     console.error("❌ verify-store-session:", e.message)
